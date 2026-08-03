@@ -15,6 +15,7 @@ REQUIRED_HOOK_EVENTS = {
     "SessionStart",
     "UserPromptSubmit",
     "PermissionRequest",
+    "PostToolUse",
     "Stop",
     "SessionEnd",
 }
@@ -80,7 +81,7 @@ def validate_plugin_tree(plugin_path: Path) -> None:
     hooks_document = _load_json(hooks_path)
     hooks = hooks_document.get("hooks")
     if not isinstance(hooks, dict) or set(hooks) != REQUIRED_HOOK_EVENTS:
-        raise RuntimeError("hooks.json 必须且只能注册五个 CodexBot 生命周期事件")
+        raise RuntimeError("hooks.json 必须且只能注册六个 CodexBot 生命周期事件")
     for event_name in REQUIRED_HOOK_EVENTS:
         groups = hooks.get(event_name)
         if not isinstance(groups, list) or not groups:

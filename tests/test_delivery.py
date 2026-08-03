@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+import time
 
 import pytest
 
 from codexbot.delivery import RateLimiter, classify_delivery_error, deliver_item, notification_text
-from codexbot.store import Store
+from codexbot.store import PERMISSION_NOTIFICATION_DELAY, Store
 
 
 class NoWaitLimiter:
@@ -60,11 +61,12 @@ async def test_event_order_and_exact_final_content(tmp_path: Path) -> None:
         messages.append(text)
         return object()
 
-    while (item := store.get_due_outbox()) is not None:
+    while (item := store.get_due_outbox(now=time.time() + PERMISSION_NOTIFICATION_DELAY + 1)) is not None:
         await deliver_item(store, item, "owner", sender, NoWaitLimiter())  # type: ignore[arg-type]
 
     assert "开始处理" in messages[0]
-    assert "等待本机审批" in messages[1]
+    assert "出现权限请求" in messages[1]
+    assert "QQ 不能直接审批" in messages[1]
     assert "Codex 已完成" in messages[2]
     assert len(messages) > 3
 

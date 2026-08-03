@@ -74,11 +74,11 @@ def notification_text(item: OutboxItem) -> str:
         )
     if item.kind == "permission_required":
         return (
-            "⏸ Codex 等待本机审批\n"
+            "⏸ Codex 出现权限请求\n"
             f"项目：{payload.get('project', 'unknown')}\n"
             f"工具：{payload.get('tool', 'unknown')}\n"
             f"原因：{payload.get('reason', '需要确认的操作')}\n"
-            "请返回 Codex 完成审批。"
+            "请在 Codex 中完成审批；如果已启用自动审批且任务继续，此消息可忽略。QQ 不能直接审批。"
         )
     if item.kind == "final_reply":
         return (

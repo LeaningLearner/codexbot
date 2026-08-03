@@ -6,7 +6,7 @@ import sqlite3
 import time
 
 from codexbot.processes import HostProcess
-from codexbot.store import Store
+from codexbot.store import PERMISSION_NOTIFICATION_DELAY, Store
 
 
 def _rows(path: Path, query: str) -> list[sqlite3.Row]:
@@ -119,3 +119,41 @@ def test_distinct_permission_tool_calls_are_not_collapsed(tmp_path: Path) -> Non
 
     count = _rows(store.path, "SELECT COUNT(*) AS count FROM outbox")[0]["count"]
     assert count == 2
+
+
+def test_permission_notification_is_suppressed_when_tool_runs(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    permission = _event(
+        "PermissionRequest",
+        tool_use_id="call-1",
+        tool_name="shell_command",
+        tool_input={"description": "自动审查中的操作"},
+    )
+    assert store.ingest_hook(permission)
+    assert store.get_due_outbox() is None
+
+    post_tool = _event(
+        "PostToolUse",
+        tool_use_id="call-1",
+        tool_name="shell_command",
+        tool_response={"exit_code": 0},
+    )
+    assert store.ingest_hook(post_tool) is False
+    row = _rows(store.path, "SELECT state, last_error FROM outbox")[0]
+    assert row["state"] == "suppressed"
+    assert "resolved" in row["last_error"]
+    assert store.get_due_outbox(now=time.time() + PERMISSION_NOTIFICATION_DELAY + 1) is None
+
+
+def test_non_interactive_permission_modes_do_not_create_waiting_notice(tmp_path: Path) -> None:
+    for mode in ("dontAsk", "bypassPermissions"):
+        store = Store(tmp_path / f"{mode}.sqlite3")
+        assert store.ingest_hook(
+            _event(
+                "PermissionRequest",
+                permission_mode=mode,
+                tool_name="shell_command",
+                tool_input={"description": "不应发出等待通知"},
+            )
+        ) is False
+        assert _rows(store.path, "SELECT COUNT(*) AS count FROM outbox")[0]["count"] == 0

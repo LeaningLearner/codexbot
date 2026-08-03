@@ -13,6 +13,9 @@ from .processes import HostProcess
 from .security import hash_pairing_code, prompt_preview, redact_secrets
 
 
+PERMISSION_NOTIFICATION_DELAY = 5.0
+
+
 @dataclass(frozen=True)
 class OutboxItem:
     id: int
@@ -148,9 +151,63 @@ class Store:
             candidate = str(tool_input)
         return prompt_preview(redact_secrets(candidate), 180) or "Codex 请求执行需要本机确认的操作"
 
+    @staticmethod
+    def _permission_mode_skips_notification(event: dict[str, Any]) -> bool:
+        mode = str(event.get("permission_mode") or "").casefold()
+        return mode in {"dontask", "bypasspermissions"}
+
+    @staticmethod
+    def _resolve_permission_outbox(
+        connection: sqlite3.Connection,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        event: dict[str, Any],
+    ) -> None:
+        """Suppress a pending request once the corresponding tool actually runs."""
+
+        event_tool = str(event.get("tool_name") or "")
+        event_use_id = str(event.get("tool_use_id") or "")
+        rows = connection.execute(
+            """
+            SELECT id, payload_json FROM outbox
+            WHERE kind = 'permission_required'
+              AND session_id = ?
+              AND turn_id IS ?
+              AND state = 'pending'
+            ORDER BY id ASC
+            """,
+            (session_id, turn_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            request_tool = str(payload.get("tool") or "")
+            request_use_id = str(payload.get("tool_use_id") or "")
+            if request_use_id and event_use_id:
+                matches = request_use_id == event_use_id
+            else:
+                matches = bool(request_tool and event_tool and request_tool == event_tool)
+            if not matches:
+                continue
+            connection.execute(
+                "UPDATE outbox SET state = 'suppressed', last_error = ? WHERE id = ?",
+                ("permission request resolved by tool execution", int(row["id"])),
+            )
+            return
+
     def ingest_hook(self, event: dict[str, Any], host: HostProcess | None = None) -> bool:
         event_name = str(event.get("hook_event_name", ""))
-        if event_name not in {"SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop", "SessionEnd"}:
+        if event_name not in {
+            "SessionStart",
+            "UserPromptSubmit",
+            "PermissionRequest",
+            "PostToolUse",
+            "Stop",
+            "SessionEnd",
+        }:
             raise ValueError(f"unsupported hook event: {event_name}")
 
         now = time.time()
@@ -170,15 +227,20 @@ class Store:
             kind = "task_started"
             payload = {"project": project, "model": model, "preview": preview, "created_at": now}
         elif event_name == "PermissionRequest":
-            status = "awaiting_approval"
-            kind = "permission_required"
-            payload = {
-                "project": project,
-                "model": model,
-                "tool": str(event.get("tool_name") or "unknown"),
-                "reason": self._permission_preview(event),
-                "created_at": now,
-            }
+            status = "running"
+            if not self._permission_mode_skips_notification(event):
+                status = "awaiting_approval"
+                kind = "permission_required"
+                payload = {
+                    "project": project,
+                    "model": model,
+                    "tool": str(event.get("tool_name") or "unknown"),
+                    "tool_use_id": str(event.get("tool_use_id") or ""),
+                    "reason": self._permission_preview(event),
+                    "created_at": now,
+                }
+        elif event_name == "PostToolUse":
+            status = "running"
         elif event_name == "Stop":
             status = "completed"
             answer = str(event.get("last_assistant_message") or "")
@@ -208,6 +270,14 @@ class Store:
                         last_seen = excluded.last_seen
                     """,
                     (host.pid, host.create_time, host.kind, now),
+                )
+
+            if event_name == "PostToolUse":
+                self._resolve_permission_outbox(
+                    connection,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    event=event,
                 )
 
             existing = connection.execute(
@@ -257,8 +327,8 @@ class Store:
                     """
                     INSERT OR IGNORE INTO outbox(
                         event_key, kind, session_id, turn_id, payload_json, state, created_at,
-                        last_error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        next_attempt_at, last_error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_key,
@@ -268,6 +338,9 @@ class Store:
                         json.dumps(payload, ensure_ascii=False),
                         initial_state,
                         now,
+                        now + PERMISSION_NOTIFICATION_DELAY
+                        if kind == "permission_required" and initial_state == "pending"
+                        else 0,
                         "notifications muted" if initial_state == "suppressed" else None,
                     ),
                 )

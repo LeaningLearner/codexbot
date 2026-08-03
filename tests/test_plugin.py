@@ -10,7 +10,14 @@ PLUGIN = ROOT / "plugin" / "codexbot"
 
 def test_hook_registration_is_complete_and_neutral() -> None:
     payload = json.loads((PLUGIN / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    expected = {"SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop", "SessionEnd"}
+    expected = {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PermissionRequest",
+        "PostToolUse",
+        "Stop",
+        "SessionEnd",
+    }
 
     assert set(payload["hooks"]) == expected
     for event in expected:
@@ -32,4 +39,3 @@ def test_manifest_uses_discovery_instead_of_unsupported_hook_field() -> None:
     assert "hooks" not in manifest
     assert "mcpServers" not in manifest
     assert "apps" not in manifest
-
