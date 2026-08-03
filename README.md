@@ -8,6 +8,8 @@ CodexBot 把当前 Windows Codex 应用的任务状态通过 QQ 官方机器人�
 
 ![CodexBot Hook 配置](docs/images/codex-hooks.png)
 
+上图为五项核心 Hook 的示意；当前版本还会注册 `PostToolUse`，用于在自动审批完成并实际执行后取消待发提醒。
+
 任务开始、完成或需要权限时，QQ 沙箱会收到对应的状态通知：
 
 ![CodexBot QQ 通知示例](docs/images/qq-notification.png)
