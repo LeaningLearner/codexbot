@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import hmac
 import json
+import os
 from pathlib import Path, PureWindowsPath
 import sqlite3
 import time
@@ -14,6 +15,7 @@ from .security import hash_pairing_code, prompt_preview, redact_secrets
 
 
 PERMISSION_NOTIFICATION_DELAY = 5.0
+PERMISSION_NOTIFICATION_ENV = "CODEXBOT_NOTIFY_PERMISSION_REQUESTS"
 
 
 @dataclass(frozen=True)
@@ -152,7 +154,17 @@ class Store:
         return prompt_preview(redact_secrets(candidate), 180) or "Codex 请求执行需要本机确认的操作"
 
     @staticmethod
-    def _permission_mode_skips_notification(event: dict[str, Any]) -> bool:
+    def _permission_notifications_enabled() -> bool:
+        value = os.environ.get(PERMISSION_NOTIFICATION_ENV, "")
+        return value.strip().casefold() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _permission_mode_skips_notification(cls, event: dict[str, Any]) -> bool:
+        # Codex auto-review still emits PermissionRequest, but the hook payload
+        # does not identify the reviewer. Keep QQ quiet by default; opt in only
+        # when a user explicitly wants manual approval reminders.
+        if not cls._permission_notifications_enabled():
+            return True
         mode = str(event.get("permission_mode") or "").casefold()
         return mode in {"dontask", "bypasspermissions"}
 
@@ -567,6 +579,12 @@ class Store:
         cutoff = now - 7 * 24 * 60 * 60
         with self._connect() as connection:
             connection.execute("DELETE FROM inbound_messages WHERE created_at < ?", (cutoff,))
+            if not self._permission_notifications_enabled():
+                connection.execute(
+                    "UPDATE outbox SET state = 'suppressed', last_error = ? "
+                    "WHERE state = 'pending' AND kind = 'permission_required'",
+                    ("permission notifications disabled",),
+                )
             connection.execute(
                 "DELETE FROM outbox "
                 "WHERE state IN ('delivered', 'suppressed', 'failed_permanent') AND created_at < ?",

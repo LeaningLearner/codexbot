@@ -8,7 +8,7 @@ import time
 import pytest
 
 from codexbot.delivery import RateLimiter, classify_delivery_error, deliver_item, notification_text
-from codexbot.store import PERMISSION_NOTIFICATION_DELAY, Store
+from codexbot.store import PERMISSION_NOTIFICATION_DELAY, PERMISSION_NOTIFICATION_ENV, Store
 
 
 class NoWaitLimiter:
@@ -40,8 +40,11 @@ def _outbox_row(store: Store) -> sqlite3.Row:
 
 
 @pytest.mark.asyncio
-async def test_event_order_and_exact_final_content(tmp_path: Path) -> None:
+async def test_event_order_and_exact_final_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = Store(tmp_path / "state.sqlite3")
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
     store.ingest_hook(_event("UserPromptSubmit", "turn-1", prompt="开始"))
     store.ingest_hook(
         _event(

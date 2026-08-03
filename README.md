@@ -8,9 +8,9 @@ CodexBot 把当前 Windows Codex 应用的任务状态通过 QQ 官方机器人�
 
 ![CodexBot Hook 配置](docs/images/codex-hooks.png)
 
-上图为五项核心 Hook 的示意；当前版本还会注册 `PostToolUse`，用于在自动审批完成并实际执行后取消待发提醒。
+上图为五项核心 Hook 的示意；当前版本还会注册 `PostToolUse`，用于在显式开启权限提醒时取消已经执行的待发提醒。
 
-任务开始、完成或需要权限时，QQ 沙箱会收到对应的状态通知：
+任务开始和完成时，QQ 沙箱会收到对应的状态通知；权限请求默认不转发，避免把 Codex 的自动审查误报成等待人工审批：
 
 ![CodexBot QQ 通知示例](docs/images/qq-notification.png)
 
@@ -80,7 +80,7 @@ QQ 开放平台的页面名称可能随版本更新而变化，下面按当前�
 ## 通知行为
 
 - 提交任务：项目、模型、时间和脱敏后的提示词前 120 字。
-- 请求权限：先等待工具结果确认；只有手动审批仍未执行时，才发送工具和简短原因，并提醒返回 Codex 本机审批。自动审查或自动通过的请求会在 `PostToolUse` 到达后取消待发通知。
+- 请求权限：默认不发送。Codex 的“替我审批/自动审查”仍会触发 `PermissionRequest` Hook，但 Hook 没有单独的 `auto_review` 标记，无法可靠区分人工审批和审查代理；如确实需要人工审批提醒，可在启动 Codex 前设置 `CODEXBOT_NOTIFY_PERMISSION_REQUESTS=1`。该提醒仅供查看，QQ 不能直接审批。
 - 任务停止：Codex `last_assistant_message` 的完整文本，按 QQ 限制自动分段。
 - 不发送隐藏推理、工具日志、子代理输出、图片或附件。
 

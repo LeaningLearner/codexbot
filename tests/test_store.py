@@ -5,8 +5,10 @@ from pathlib import Path
 import sqlite3
 import time
 
+import pytest
+
 from codexbot.processes import HostProcess
-from codexbot.store import PERMISSION_NOTIFICATION_DELAY, Store
+from codexbot.store import PERMISSION_NOTIFICATION_DELAY, PERMISSION_NOTIFICATION_ENV, Store
 
 
 def _rows(path: Path, query: str) -> list[sqlite3.Row]:
@@ -30,9 +32,12 @@ def _event(name: str, **extra: object) -> dict[str, object]:
     return event
 
 
-def test_hook_ingestion_redacts_deduplicates_and_keeps_full_final_reply(tmp_path: Path) -> None:
+def test_hook_ingestion_redacts_deduplicates_and_keeps_full_final_reply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database = tmp_path / "state.sqlite3"
     store = Store(database)
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
     full_prompt = "请检查 api_key=never-write-this " + "中文任务 " * 40
     host = HostProcess(123, 456.5, "desktop")
     start = _event("UserPromptSubmit", prompt=full_prompt)
@@ -106,8 +111,11 @@ def test_muted_events_are_suppressed_at_ingestion_and_never_backfilled(tmp_path:
     assert store.get_due_outbox() is not None
 
 
-def test_distinct_permission_tool_calls_are_not_collapsed(tmp_path: Path) -> None:
+def test_distinct_permission_tool_calls_are_not_collapsed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = Store(tmp_path / "state.sqlite3")
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
     base = {
         "tool_name": "shell_command",
         "tool_input": {"command": "same-command"},
@@ -121,8 +129,11 @@ def test_distinct_permission_tool_calls_are_not_collapsed(tmp_path: Path) -> Non
     assert count == 2
 
 
-def test_permission_notification_is_suppressed_when_tool_runs(tmp_path: Path) -> None:
+def test_permission_notification_is_suppressed_when_tool_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = Store(tmp_path / "state.sqlite3")
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
     permission = _event(
         "PermissionRequest",
         tool_use_id="call-1",
@@ -145,7 +156,25 @@ def test_permission_notification_is_suppressed_when_tool_runs(tmp_path: Path) ->
     assert store.get_due_outbox(now=time.time() + PERMISSION_NOTIFICATION_DELAY + 1) is None
 
 
-def test_non_interactive_permission_modes_do_not_create_waiting_notice(tmp_path: Path) -> None:
+def test_permission_requests_are_quiet_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(PERMISSION_NOTIFICATION_ENV, raising=False)
+    store = Store(tmp_path / "default.sqlite3")
+    assert store.ingest_hook(
+        _event(
+            "PermissionRequest",
+            tool_name="shell_command",
+            tool_input={"description": "auto-review should not notify QQ"},
+        )
+    ) is False
+    assert _rows(store.path, "SELECT COUNT(*) AS count FROM outbox")[0]["count"] == 0
+
+
+def test_non_interactive_permission_modes_do_not_create_waiting_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
     for mode in ("dontAsk", "bypassPermissions"):
         store = Store(tmp_path / f"{mode}.sqlite3")
         assert store.ingest_hook(
