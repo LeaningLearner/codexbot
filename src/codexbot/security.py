@@ -10,12 +10,22 @@ from dataclasses import dataclass
 
 PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
+_SECRET_KEY_NAMES = (
+    r"(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|"
+    r"app[_-]?secret|client[_-]?secret|password|passwd|token|secret)"
+)
+_JSON_SECRET_PATTERN = re.compile(
+    rf'(?P<prefix>"{_SECRET_KEY_NAMES}"\s*:\s*")'
+    r'(?P<value>(?:\\.|[^"\\])*)(?P<suffix>")',
+    re.IGNORECASE,
+)
+
 _SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/]+=*"),
     re.compile(
-        r"(?i)\b(api[_-]?key|app[_-]?secret|password|passwd|token|secret)"
-        r"(\s*[:=]\s*)([^\s,;]+)"
+        rf"\b({_SECRET_KEY_NAMES})(\s*[:=]\s*)([^\s,;]+)",
+        re.IGNORECASE,
     ),
 )
 
@@ -27,7 +37,10 @@ class Credentials:
 
 
 def redact_secrets(text: str) -> str:
-    result = text
+    result = _JSON_SECRET_PATTERN.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]{match.group('suffix')}",
+        text,
+    )
     result = _SECRET_PATTERNS[0].sub("[REDACTED]", result)
     result = _SECRET_PATTERNS[1].sub("Bearer [REDACTED]", result)
     result = _SECRET_PATTERNS[2].sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", result)

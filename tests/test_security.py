@@ -25,6 +25,24 @@ def test_redacts_common_secret_shapes() -> None:
     assert result.count("[REDACTED]") == 5
 
 
+def test_redacts_json_secret_values_without_leaking_quoted_contents() -> None:
+    source = (
+        '{"api_key": "json-api-secret,with punctuation", '
+        '"appSecret":"json-app-secret", '
+        '"access_token": "json-access-token", '
+        '"client_secret": "json-client-secret"}'
+    )
+
+    result = redact_secrets(source)
+
+    assert "json-api-secret" not in result
+    assert "json-app-secret" not in result
+    assert "json-access-token" not in result
+    assert "json-client-secret" not in result
+    assert result.count("[REDACTED]") == 4
+    assert '"api_key": "[REDACTED]"' in result
+
+
 def test_prompt_preview_is_compact_bounded_and_emoji_safe() -> None:
     source = "  请处理\n\n" + ("资料👨‍👩‍👧‍👦 " * 40) + "token=do-not-store"
 

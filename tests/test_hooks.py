@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import importlib.util
 import os
@@ -50,6 +51,97 @@ def test_bootstrap_is_neutral_when_runtime_is_missing_and_never_logs_payload(tmp
     log = (tmp_path / "logs" / "bootstrap.log").read_text(encoding="utf-8")
     assert secret_payload not in log
     assert "runtime is not installed" in log
+
+
+def test_bootstrap_error_log_is_rotated_and_bounded(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    module = _load_bootstrap()
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "bootstrap.log"
+    log_path.write_bytes(b"x" * module.BOOTSTRAP_LOG_MAX_BYTES)
+
+    monkeypatch.setattr(module, "_data_dir", lambda: tmp_path)
+    module._record_bootstrap_error("bounded bootstrap error")
+
+    assert (log_dir / "bootstrap.log.1").is_file()
+    assert log_path.stat().st_size < module.BOOTSTRAP_LOG_MAX_BYTES
+
+
+def test_bootstrap_rejects_oversized_payload_without_handoff(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    module = _load_bootstrap()
+    secret = b"oversized-secret-value"
+    payload = secret + b"x" * module.BOOTSTRAP_PAYLOAD_MAX_BYTES
+
+    class FakeInput:
+        buffer = io.BytesIO(payload)
+
+    monkeypatch.setattr(module, "_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(module.sys, "stdin", FakeInput())
+    monkeypatch.setattr(
+        module,
+        "_launch_runtime",
+        lambda *args: (_ for _ in ()).throw(AssertionError("oversized payload was handed off")),
+    )
+
+    assert module.main() == 0
+    assert json.loads(capsys.readouterr().out) == {}
+    log = (tmp_path / "logs" / "bootstrap.log").read_text(encoding="utf-8")
+    assert "exceeded" in log
+    assert secret.decode("ascii") not in log
+
+
+def test_bootstrap_handoffs_payload_without_waiting_and_stays_neutral(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:  # type: ignore[no-untyped-def]
+    module = _load_bootstrap()
+    runtime = tmp_path / "runtime" / "Scripts" / "python.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.touch()
+    payload = b'{"hook_event_name":"Stop","last_assistant_message":"reply"}'
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.closed = False
+
+        def write(self, value: bytes) -> int:
+            self.data.extend(value)
+            return len(value)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdin = FakeStdin()
+
+    process = FakeProcess()
+    calls: dict[str, object] = {}
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        calls["command"] = command
+        calls["kwargs"] = kwargs
+        return process
+
+    class FakeInput:
+        buffer = io.BytesIO(payload)
+
+    monkeypatch.setattr(module, "_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(module.sys, "stdin", FakeInput())
+
+    assert module.main() == 0
+
+    assert json.loads(capsys.readouterr().out) == {}
+    assert calls["command"] == [str(runtime), "-E", "-m", "codexbot.hooks"]
+    kwargs = calls["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stdin"] == module.subprocess.PIPE
+    assert "timeout" not in kwargs
+    assert bytes(process.stdin.data) == payload
+    assert process.stdin.closed
 
 
 def test_runtime_hook_writes_queue_and_returns_empty_json(tmp_path: Path) -> None:

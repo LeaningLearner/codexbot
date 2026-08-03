@@ -3,6 +3,7 @@ from __future__ import annotations
 from codexbot.processes import (
     HostProcess,
     ProcessInfo,
+    ensure_daemon,
     isolated_python_environment,
     process_matches,
     select_codex_host,
@@ -42,6 +43,33 @@ def test_cli_and_app_server_fallbacks() -> None:
     assert select_codex_host([cli]) == HostProcess(40, 40.0, "cli")
 
 
+def test_process_detection_accepts_variant_names_and_paths() -> None:
+    app_server = _process(
+        21,
+        "codex",
+        r"D:\Tools\codex-aarch64.exe",
+        "codex",
+        "--app-server",
+    )
+    desktop = _process(
+        31,
+        "ChatGPT.exe",
+        r"D:\Apps\ChatGPT\ChatGPT.exe",
+        "ChatGPT.exe",
+    )
+    assert select_codex_host([app_server, desktop]) == HostProcess(31, 31.0, "desktop")
+
+    node_cli = _process(
+        41,
+        "node.exe",
+        r"C:\Program Files\nodejs\node.exe",
+        "node",
+        r"C:\Tools\codex.js",
+        "exec",
+    )
+    assert select_codex_host([node_cli]) == HostProcess(41, 41.0, "cli")
+
+
 def test_pid_reuse_is_rejected(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     class FakeProcess:
         def __init__(self, pid: int) -> None:
@@ -70,3 +98,32 @@ def test_python_distribution_environment_is_removed() -> None:
     )
 
     assert environment == {"PATH": r"C:\Windows"}
+
+
+def test_daemon_start_records_fallback_time_when_process_lookup_raises_oserror(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    class State:
+        info: tuple[int, float] | None = None
+
+        def get_daemon_info(self) -> tuple[int, float] | None:
+            return self.info
+
+        def set_daemon_info(self, pid: int, create_time: float) -> None:
+            self.info = (pid, create_time)
+
+    class Child:
+        pid = 4321
+
+    class BrokenProcess:
+        def __init__(self, _pid: int) -> None:
+            raise OSError("process table unavailable")
+
+    state = State()
+    monkeypatch.setattr("codexbot.processes.data_dir", lambda: tmp_path)
+    monkeypatch.setattr("codexbot.processes.psutil.Process", BrokenProcess)
+    monkeypatch.setattr("codexbot.processes.subprocess.Popen", lambda *_args, **_kwargs: Child())
+    monkeypatch.setattr("codexbot.processes.time.time", lambda: 1234.5)
+
+    assert ensure_daemon(state) is True
+    assert state.info == (4321, 1234.5)

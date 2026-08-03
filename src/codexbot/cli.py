@@ -16,8 +16,16 @@ from .botpy_safety import silence_botpy_logging
 from .installer import find_codex_command, install_personal_plugin, marketplace_contains_plugin
 from .paths import data_dir, database_path, ensure_data_dir, runtime_python
 from .processes import process_matches
-from .security import generate_pairing_code, load_credentials, store_credentials
+from .security import generate_pairing_code, load_credentials, redact_secrets, store_credentials
 from .store import Store
+
+
+def _safe_cli_text(value: object, *, fallback: str = "外部命令失败", limit: int = 300) -> str:
+    """Redact and bound text originating outside CodexBot before printing it."""
+
+    text = redact_secrets(str(value or "")).replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())[:limit]
+    return text or fallback
 
 
 def create_pairing(store: Store) -> tuple[str, float]:
@@ -52,7 +60,7 @@ def command_setup(args: argparse.Namespace) -> int:
     print(f"插件已安装：{result.plugin_path}")
     print(f"个人 marketplace：{result.marketplace_path}")
     if result.codex_output:
-        print(result.codex_output)
+        print(_safe_cli_text(result.codex_output))
 
     code, expiry = create_pairing(Store(database_path()))
     print("")
@@ -83,7 +91,7 @@ async def _qq_online_check() -> tuple[bool, str]:
         connected = bool(robot and isinstance(gateway, dict) and gateway.get("url"))
         return connected, "沙箱认证与 Gateway 检查成功" if connected else "沙箱 API 未返回机器人或 Gateway 信息"
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:180]}"
+        return False, f"{type(exc).__name__}: {_safe_cli_text(exc, limit=180)}"
 
 
 def _codex_plugin_installed() -> tuple[bool, str]:
@@ -101,7 +109,7 @@ def _codex_plugin_installed() -> tuple[bool, str]:
             check=False,
         )
         if completed.returncode:
-            return False, (completed.stderr or completed.stdout).strip()[:180]
+            return False, _safe_cli_text(completed.stderr or completed.stdout, limit=180)
         payload = json.loads(completed.stdout)
         installed = payload.get("installed", []) if isinstance(payload, dict) else []
         match = next((item for item in installed if isinstance(item, dict) and item.get("name") == "codexbot"), None)
@@ -109,7 +117,7 @@ def _codex_plugin_installed() -> tuple[bool, str]:
             return bool(match.get("enabled", True)), "已安装并启用" if match.get("enabled", True) else "已安装但未启用"
         return False, "Codex 未报告已安装的 codexbot"
     except Exception as exc:
-        return False, f"{type(exc).__name__}: {str(exc)[:180]}"
+        return False, f"{type(exc).__name__}: {_safe_cli_text(exc, limit=180)}"
 
 
 def command_doctor(args: argparse.Namespace) -> int:
@@ -179,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         print("已取消。", file=sys.stderr)
         return 130
     except Exception as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        print(f"错误：{_safe_cli_text(exc)}", file=sys.stderr)
         return 1
 
 

@@ -19,9 +19,13 @@ class QQRuntime:
         self.stop_event = asyncio.Event()
         self.ready_event = asyncio.Event()
         self.commands = CommandService(store)
+        self.current_client: Any | None = None
         self.limiter = RateLimiter(per_minute=18)
         self.monitor_interval = 1.0
         self.empty_host_checks = 2
+        # Leave enough time for rate-limited chunks of the final reply while
+        # still guaranteeing that shutdown cannot wait forever.
+        self.shutdown_drain_timeout = 60.0
 
     async def on_ready(self) -> None:
         self.logger.info("QQ sandbox client is ready")
@@ -41,7 +45,15 @@ class QQRuntime:
             )
 
         async def active_send(target: str, text: str) -> object:
-            return await client.api.post_c2c_message(openid=target, msg_type=0, content=text)
+            active_client = self.current_client or client
+            is_closed = getattr(active_client, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                raise ConnectionError("QQ client is closed")
+            return await active_client.api.post_c2c_message(
+                openid=target,
+                msg_type=0,
+                content=text,
+            )
 
         try:
             outcome = await self.commands.handle(
@@ -73,6 +85,57 @@ class QQRuntime:
                     self.stop_event.set()
                     return
             await asyncio.sleep(self.monitor_interval)
+
+    async def drain_outbox(self, client: Any) -> None:
+        """Deliver due notifications before closing the last QQ connection."""
+
+        if not self.ready_event.is_set() or client.is_closed():
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.shutdown_drain_timeout
+        retry_wait = False
+
+        async def active_send(openid: str, text: str) -> object:
+            return await client.api.post_c2c_message(openid=openid, msg_type=0, content=text)
+
+        while not client.is_closed():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self.logger.warning("Shutdown outbox drain deadline reached")
+                return
+
+            openid = self.store.get_bound_openid()
+            item = self.store.get_due_outbox()
+            if not openid or item is None:
+                if retry_wait:
+                    await asyncio.sleep(min(1.0, remaining))
+                    continue
+                return
+
+            try:
+                outcome = await asyncio.wait_for(
+                    deliver_item(
+                        self.store,
+                        item,
+                        openid,
+                        active_send,
+                        self.limiter,
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                self.logger.warning("Shutdown outbox drain timed out")
+                return
+            except Exception as exc:
+                detail = redact_secrets(str(exc))[:300]
+                self.logger.error(
+                    "Shutdown outbox drain failed: %s: %s",
+                    type(exc).__name__,
+                    detail,
+                )
+                return
+            retry_wait = outcome == "retry"
 
     async def delivery_loop(self, client: Any) -> None:
         await self.ready_event.wait()
@@ -118,6 +181,72 @@ def _make_client(runtime: QQRuntime) -> Any:
     )
 
 
+def _report_task_exit(
+    logger: logging.Logger,
+    task: asyncio.Task[Any],
+    label: str,
+    *,
+    expected: bool,
+) -> bool:
+    """Log a task that ended and return whether it ended unexpectedly."""
+
+    if task.cancelled():
+        if not expected:
+            logger.error("%s was cancelled unexpectedly", label)
+            return True
+        return False
+
+    error = task.exception()
+    if error is not None:
+        detail = redact_secrets(str(error))[:300]
+        logger.error("%s failed: %s: %s", label, type(error).__name__, detail)
+        return True
+    if not expected:
+        logger.warning("%s exited unexpectedly", label)
+        return True
+    return False
+
+
+async def _cancel_task(task: asyncio.Task[Any]) -> None:
+    if not task.done():
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _close_client(client: Any, logger: logging.Logger) -> None:
+    try:
+        await client.close()
+    except Exception as exc:
+        detail = redact_secrets(str(exc))[:300]
+        logger.error("QQ client close failed: %s: %s", type(exc).__name__, detail)
+
+
+async def _shutdown_client(
+    runtime: QQRuntime,
+    client: Any,
+    bot_task: asyncio.Task[Any],
+    delivery_task: asyncio.Task[Any],
+    stop_task: asyncio.Task[Any],
+    logger: logging.Logger,
+    *,
+    drain: bool,
+) -> None:
+    await _cancel_task(delivery_task)
+    try:
+        if drain:
+            try:
+                await runtime.drain_outbox(client)
+            except Exception as exc:
+                detail = redact_secrets(str(exc))[:300]
+                logger.error("QQ shutdown drain failed: %s: %s", type(exc).__name__, detail)
+    finally:
+        await _close_client(client, logger)
+        if runtime.current_client is client:
+            runtime.current_client = None
+        await _cancel_task(bot_task)
+        await _cancel_task(stop_task)
+
+
 async def run_qq_runtime(
     store: Store,
     credentials: Credentials,
@@ -128,9 +257,22 @@ async def run_qq_runtime(
     runtime = QQRuntime(store, logger)
     monitor_task = asyncio.create_task(runtime.monitor_hosts(), name="codexbot-host-monitor")
     reconnect_delay = initial_reconnect_delay
+    active_client: tuple[Any, asyncio.Task[Any], asyncio.Task[Any], asyncio.Task[Any]] | None = None
     try:
         while not runtime.stop_event.is_set():
+            if monitor_task.done():
+                unexpected = _report_task_exit(
+                    logger,
+                    monitor_task,
+                    "Codex host monitor",
+                    expected=runtime.stop_event.is_set(),
+                )
+                if unexpected:
+                    runtime.stop_event.set()
+                break
+
             client = _make_client(runtime)
+            runtime.current_client = client
             runtime.ready_event.clear()
             bot_task = asyncio.create_task(
                 client.start(appid=credentials.app_id, secret=credentials.app_secret),
@@ -138,29 +280,99 @@ async def run_qq_runtime(
             )
             delivery_task = asyncio.create_task(runtime.delivery_loop(client), name="codexbot-delivery")
             stop_task = asyncio.create_task(runtime.stop_event.wait(), name="codexbot-stop-wait")
-            done, _ = await asyncio.wait({bot_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-            if stop_task in done:
-                await client.close()
-                bot_task.cancel()
-                delivery_task.cancel()
-                await asyncio.gather(bot_task, delivery_task, return_exceptions=True)
+            active_client = (client, bot_task, delivery_task, stop_task)
+            done, _ = await asyncio.wait(
+                {bot_task, delivery_task, monitor_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            stop_requested = stop_task in done or runtime.stop_event.is_set()
+            if monitor_task in done:
+                unexpected = _report_task_exit(
+                    logger,
+                    monitor_task,
+                    "Codex host monitor",
+                    expected=stop_requested,
+                )
+                if unexpected:
+                    runtime.stop_event.set()
+                    stop_requested = True
+
+            if bot_task in done:
+                _report_task_exit(
+                    logger,
+                    bot_task,
+                    "QQ connection task",
+                    expected=stop_requested,
+                )
+            if delivery_task in done:
+                unexpected = _report_task_exit(
+                    logger,
+                    delivery_task,
+                    "QQ delivery loop",
+                    expected=stop_requested,
+                )
+                if unexpected and not stop_requested:
+                    logger.warning("QQ delivery loop stopped; reconnecting")
+
+            if stop_requested or runtime.stop_event.is_set():
+                await _shutdown_client(
+                    runtime,
+                    client,
+                    bot_task,
+                    delivery_task,
+                    stop_task,
+                    logger,
+                    drain=True,
+                )
+                active_client = None
                 break
 
-            stop_task.cancel()
-            delivery_task.cancel()
-            await asyncio.gather(stop_task, delivery_task, return_exceptions=True)
-            error = bot_task.exception()
-            if error:
-                detail = redact_secrets(str(error))[:300]
-                logger.error("QQ connection ended: %s: %s", type(error).__name__, detail)
-            await client.close()
+            await _shutdown_client(
+                runtime,
+                client,
+                bot_task,
+                delivery_task,
+                stop_task,
+                logger,
+                drain=False,
+            )
+            active_client = None
+
             if runtime.ready_event.is_set():
                 reconnect_delay = initial_reconnect_delay
             try:
                 await asyncio.wait_for(runtime.stop_event.wait(), timeout=reconnect_delay)
             except asyncio.TimeoutError:
                 reconnect_delay = min(60.0, reconnect_delay * 2)
+    except asyncio.CancelledError:
+        runtime.stop_event.set()
+        if active_client is not None:
+            client, bot_task, delivery_task, stop_task = active_client
+            await _shutdown_client(
+                runtime,
+                client,
+                bot_task,
+                delivery_task,
+                stop_task,
+                logger,
+                drain=True,
+            )
+            active_client = None
+        raise
     finally:
         runtime.stop_event.set()
+        if active_client is not None:
+            client, bot_task, delivery_task, stop_task = active_client
+            await _shutdown_client(
+                runtime,
+                client,
+                bot_task,
+                delivery_task,
+                stop_task,
+                logger,
+                drain=True,
+            )
+        await runtime.commands.shutdown()
         monitor_task.cancel()
         await asyncio.gather(monitor_task, return_exceptions=True)

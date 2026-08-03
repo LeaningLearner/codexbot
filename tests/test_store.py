@@ -8,7 +8,13 @@ import time
 import pytest
 
 from codexbot.processes import HostProcess
-from codexbot.store import PERMISSION_NOTIFICATION_DELAY, PERMISSION_NOTIFICATION_ENV, Store
+from codexbot.store import (
+    LAST_REPLY_TTL_ENV,
+    OUTBOX_TTL_ENV,
+    PERMISSION_NOTIFICATION_DELAY,
+    PERMISSION_NOTIFICATION_ENV,
+    Store,
+)
 
 
 def _rows(path: Path, query: str) -> list[sqlite3.Row]:
@@ -78,6 +84,57 @@ def test_hook_ingestion_redacts_deduplicates_and_keeps_full_final_reply(
     assert full_prompt not in disk_text
     assert "never-write-this" not in disk_text
     assert "approval-secret" not in disk_text
+
+
+def test_store_explicitly_closes_sqlite_connections(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    opened: list[sqlite3.Connection] = []
+    original_connect = Store._connect
+
+    def tracked_connect(current: Store) -> sqlite3.Connection:
+        connection = original_connect(current)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(Store, "_connect", tracked_connect)
+    store.set_setting("connection-test", "closed-after-use")
+    assert store.get_setting("connection-test") == "closed-after-use"
+
+    assert opened
+    for connection in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+
+def test_full_replies_and_pending_outbox_items_expire(tmp_path: Path) -> None:
+    store = Store(
+        tmp_path / "state.sqlite3",
+        last_reply_ttl=60.0,
+        outbox_ttl=60.0,
+    )
+    final = "full reply retained for /last only during the privacy window"
+
+    assert store.ingest_hook(_event("Stop", last_assistant_message=final))
+    reply = store.get_last_reply()
+    assert reply is not None
+    created_at = float(reply["created_at"])
+    assert store.get_last_reply(now=created_at + 59.0)["content"] == final  # type: ignore[index]
+    assert store.get_due_outbox(now=created_at + 59.0) is not None
+
+    store.cleanup(now=created_at + 61.0)
+
+    assert store.get_last_reply(now=created_at + 61.0) is None
+    assert _rows(store.path, "SELECT COUNT(*) AS count FROM outbox")[0]["count"] == 0
+
+
+def test_content_ttls_are_configurable_from_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(LAST_REPLY_TTL_ENV, "12.5")
+    monkeypatch.setenv(OUTBOX_TTL_ENV, "23.5")
+
+    store = Store(tmp_path / "state.sqlite3")
+
+    assert store.last_reply_ttl == 12.5
+    assert store.outbox_ttl == 23.5
 
 
 def test_same_session_id_in_different_projects_stays_isolated(tmp_path: Path) -> None:
@@ -169,6 +226,57 @@ def test_existing_session_state_is_migrated_and_still_deduplicates(tmp_path: Pat
     assert len(sessions) == 1
     assert str(sessions[0]["session_id"]).startswith("v2:")
     assert _rows(database, "SELECT COUNT(*) AS count FROM outbox")[0]["count"] == 1
+
+
+def test_legacy_singleton_last_reply_is_migrated_before_indexes(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE last_reply (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                project TEXT NOT NULL,
+                model TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO last_reply(singleton, session_id, turn_id, project, model, content, created_at)
+            VALUES (1, 'legacy-session', 'legacy-turn', 'legacy-project', 'legacy-model', 'preserved reply', 100)
+            """
+        )
+
+    store = Store(database)
+
+    reply = store.get_last_reply(now=100)
+    assert reply is not None
+    assert reply["content"] == "preserved reply"
+    columns = [row["name"] for row in _rows(database, "PRAGMA table_info(last_reply)")]
+    assert "singleton" not in columns
+    assert "reply_id" in columns
+    assert _rows(database, "SELECT COUNT(*) AS count FROM last_reply")[0]["count"] == 1
+
+
+def test_last_reply_history_is_bounded_per_session_and_selectable_by_project(tmp_path: Path) -> None:
+    store = Store(tmp_path / "history.sqlite3", last_reply_limit=2)
+    for index in range(3):
+        assert store.ingest_hook(
+            _event(
+                "Stop",
+                turn_id=f"turn-{index}",
+                cwd=r"D:\work\history-project",
+                last_assistant_message=f"reply-{index}",
+            )
+        )
+
+    replies = store.get_last_replies(project="history-project")
+    assert [reply["content"] for reply in replies] == ["reply-2", "reply-1"]
+    assert store.get_last_reply(project="history-project")["content"] == "reply-2"  # type: ignore[index]
 
 
 def test_pairing_expiry_binding_and_prebinding_suppression(tmp_path: Path) -> None:

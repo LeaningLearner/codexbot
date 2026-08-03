@@ -3,7 +3,11 @@ setlocal
 chcp 65001 >nul
 
 set "CODEXBOT_ROOT=%~dp0"
-set "CODEXBOT_DATA=%LOCALAPPDATA%\CodexBot"
+if defined CODEXBOT_DATA_DIR (
+  set "CODEXBOT_DATA=%CODEXBOT_DATA_DIR%"
+) else (
+  set "CODEXBOT_DATA=%LOCALAPPDATA%\CodexBot"
+)
 set "CODEXBOT_RUNTIME=%CODEXBOT_DATA%\runtime"
 set "CODEXBOT_PYTHON=%CODEXBOT_RUNTIME%\Scripts\python.exe"
 set "CODEXBOT_BASE_PYTHON="
@@ -34,13 +38,18 @@ if not exist "%CODEXBOT_PYTHON%" (
   %CODEXBOT_BASE_PYTHON% -m venv "%CODEXBOT_RUNTIME%"
   if errorlevel 1 goto :fail
 ) else (
+  "%CODEXBOT_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)" >nul 2>&1
+  if errorlevel 1 (
+    echo [ERROR] Existing runtime is not Python 3.11.x. Recreate the runtime and run install.cmd again.
+    goto :fail
+  )
   echo [1/4] 复用现有隔离 Python 运行时。
 )
 
 echo [2/4] 安装 CodexBot 与锁定依赖...
-"%CODEXBOT_PYTHON%" -m pip install --disable-pip-version-check --requirement "%CODEXBOT_ROOT%requirements.lock"
+"%CODEXBOT_PYTHON%" -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes --requirement "%CODEXBOT_ROOT%requirements.lock"
 if errorlevel 1 goto :fail
-"%CODEXBOT_PYTHON%" -m pip install --disable-pip-version-check --no-deps "%CODEXBOT_ROOT%."
+"%CODEXBOT_PYTHON%" -m pip install --disable-pip-version-check --no-deps --no-build-isolation "%CODEXBOT_ROOT%."
 if errorlevel 1 goto :fail
 
 echo [3/4] 配置 QQ 凭据与个人 Codex 插件...

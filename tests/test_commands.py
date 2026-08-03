@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
+from codexbot.codex_login import AccountInfo, DeviceLoginResult, DeviceLoginStart
 from codexbot.commands import CommandService
+from codexbot.codex_usage import parse_rate_limits
 from codexbot.store import Store
 
 
@@ -24,6 +27,61 @@ class SendRecorder:
             raise ConnectionError("disabled")
         return object()
 
+
+class FakeCodexClient:
+    def read_account(self) -> AccountInfo:
+        return AccountInfo("owner@example.com", "plus", "chatgpt")
+
+    def read_rate_limits(self) -> dict[str, object]:
+        return {
+            "rateLimitsByLimitId": {
+                "five_hour": {
+                    "limitName": "5h",
+                    "primary": {"usedPercent": 25, "windowDurationMins": 300, "resetsAt": 1_800_000_000},
+                    "secondary": {"usedPercent": 50, "windowDurationMins": 10_080, "resetsAt": 1_800_100_000},
+                }
+            }
+        }
+
+
+class FakeLoginService:
+    def __init__(self) -> None:
+        self.callback = None
+        self.cancelled = False
+
+    def start_device_login(self, *, on_complete=None) -> DeviceLoginStart:
+        self.callback = on_complete
+        return DeviceLoginStart("login-1", "https://example.test/device", "ABCD-EFGH")
+
+    def cancel_device_login(self) -> bool:
+        self.cancelled = True
+        return True
+
+
+def test_usage_parser_keeps_primary_and_secondary_for_multiple_limit_ids() -> None:
+    snapshot = parse_rate_limits(
+        {
+            "rateLimitsByLimitId": {
+                "workspace": {
+                    "limitName": "Workspace",
+                    "limitId": "workspace",
+                    "primary": {"usedPercent": 10},
+                    "secondary": {"usedPercent": 20},
+                },
+                "personal": {
+                    "limitId": "personal",
+                    "primary": {"usedPercent": 30},
+                    "secondary": {"usedPercent": 40},
+                },
+            }
+        }
+    )
+    assert [bucket.name for bucket in snapshot.buckets] == [
+        "Workspace/primary",
+        "Workspace/secondary",
+        "personal/primary",
+        "personal/secondary",
+    ]
 
 def _event(name: str, **extra: object) -> dict[str, object]:
     payload: dict[str, object] = {
@@ -133,3 +191,75 @@ async def test_binding_survives_failed_proactive_test(tmp_path: Path) -> None:
     assert store.get_bound_openid() == "owner"
     assert [message[3] for message in sent.passive] == [1]
     assert "主动通知测试失败" in sent.passive[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_usage_and_account_commands_use_codex_app_server_data(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    sent = SendRecorder()
+    store.create_pairing("ABCD-EF23", expires_at=10_000_000_000.0)
+    assert store.consume_pairing("ABCD-EF23", "owner", now=1.0)
+    service = CommandService(store, codex_client=FakeCodexClient())
+
+    assert await service.handle(
+        openid="owner",
+        message_id="usage-command",
+        content="/usage",
+        passive_send=sent.passive_send,
+        active_send=sent.active_send,
+    ) == "replied"
+    assert "5h/primary" in sent.passive[-1][1]
+    assert "剩余 75%" in sent.passive[-1][1]
+
+    assert await service.handle(
+        openid="owner",
+        message_id="account-command",
+        content="/codex_account",
+        passive_send=sent.passive_send,
+        active_send=sent.active_send,
+    ) == "replied"
+    assert "owner@example.com" in sent.passive[-1][1]
+    assert "ChatGPT 登录" in sent.passive[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_device_login_completion_uses_active_sender_and_real_start_type(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    sent = SendRecorder()
+    store.create_pairing("ABCD-EF23", expires_at=10_000_000_000.0)
+    assert store.consume_pairing("ABCD-EF23", "owner", now=1.0)
+    login = FakeLoginService()
+    service = CommandService(store, login_service=login)
+
+    assert await service.handle(
+        openid="owner",
+        message_id="login-command",
+        content="/codex_login",
+        passive_send=sent.passive_send,
+        active_send=sent.active_send,
+    ) == "replied"
+    assert "verificationUrl: https://example.test/device" in sent.passive[-1][1]
+    assert "userCode: ABCD-EFGH" in sent.passive[-1][1]
+    assert sent.active == []
+    assert login.callback is not None
+
+    login.callback(
+        DeviceLoginResult(
+            started=DeviceLoginStart("login-1", "https://example.test/device", "ABCD-EFGH"),
+            completed=True,
+            account=AccountInfo("new@example.com", "plus", "chatgpt"),
+        )
+    )
+    await asyncio.sleep(0.01)
+    assert sent.active == [("owner", "Codex 设备码登录完成，账号已切换。\n邮箱：new@example.com")]
+    assert all(len(message) == 2 for message in sent.active)
+
+
+@pytest.mark.asyncio
+async def test_command_service_shutdown_cancels_device_login(tmp_path: Path) -> None:
+    login = FakeLoginService()
+    service = CommandService(Store(tmp_path / "state.sqlite3"), login_service=login)
+
+    await service.shutdown()
+
+    assert login.cancelled is True

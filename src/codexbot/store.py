@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from hashlib import sha256
 import hmac
 import json
+import math
 import ntpath
 import os
 from pathlib import Path, PureWindowsPath
 import sqlite3
 import time
+from collections.abc import Iterator
 from typing import Any, Iterable
 
 from .processes import HostProcess
@@ -17,6 +20,12 @@ from .security import hash_pairing_code, prompt_preview, redact_secrets
 
 PERMISSION_NOTIFICATION_DELAY = 5.0
 PERMISSION_NOTIFICATION_ENV = "CODEXBOT_NOTIFY_PERMISSION_REQUESTS"
+DEFAULT_CONTENT_TTL_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_LAST_REPLY_HISTORY_LIMIT = 20
+LAST_REPLY_TTL_ENV = "CODEXBOT_LAST_REPLY_TTL_SECONDS"
+OUTBOX_TTL_ENV = "CODEXBOT_OUTBOX_TTL_SECONDS"
+LAST_REPLY_SCHEMA_VERSION = "2"
+LAST_REPLY_SCHEMA_VERSION_KEY = "last_reply_schema_version"
 SESSION_SCOPE_VERSION = "2"
 SESSION_SCOPE_VERSION_KEY = "session_scope_version"
 SESSION_KEY_PREFIX = "v2:"
@@ -37,20 +46,78 @@ class OutboxItem:
 
 
 class Store:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        last_reply_ttl: float | None = None,
+        outbox_ttl: float | None = None,
+        last_reply_limit: int | None = None,
+    ) -> None:
         self.path = Path(path)
+        self.last_reply_ttl = self._resolve_ttl(
+            last_reply_ttl,
+            LAST_REPLY_TTL_ENV,
+        )
+        self.outbox_ttl = self._resolve_ttl(outbox_ttl, OUTBOX_TTL_ENV)
+        self.last_reply_limit = self._resolve_history_limit(last_reply_limit)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
+    @staticmethod
+    def _resolve_ttl(value: float | None, environment_key: str) -> float:
+        configured = value
+        if configured is None:
+            raw = os.environ.get(environment_key)
+            if raw is not None and raw.strip():
+                try:
+                    configured = float(raw)
+                except ValueError:
+                    configured = None
+        if configured is None:
+            return float(DEFAULT_CONTENT_TTL_SECONDS)
+        try:
+            seconds = float(configured)
+        except (TypeError, ValueError):
+            return float(DEFAULT_CONTENT_TTL_SECONDS)
+        if not math.isfinite(seconds) or seconds < 0:
+            return float(DEFAULT_CONTENT_TTL_SECONDS)
+        return seconds
+
+    @staticmethod
+    def _resolve_history_limit(value: int | None) -> int:
+        if value is None:
+            return DEFAULT_LAST_REPLY_HISTORY_LIMIT
+        try:
+            limit = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_LAST_REPLY_HISTORY_LIMIT
+        return max(1, min(limit, 1000))
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=3.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 3000")
-        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 3000")
+            connection.execute("PRAGMA foreign_keys = ON")
+        except Exception:
+            connection.close()
+            raise
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Open one short-lived connection and always close it after commit/rollback."""
+
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def _initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
             if not journal_mode or str(journal_mode[0]).casefold() != "wal":
                 connection.execute("PRAGMA journal_mode = WAL")
@@ -100,7 +167,7 @@ class Store:
                     ON outbox (state, next_attempt_at, id);
 
                 CREATE TABLE IF NOT EXISTS last_reply (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    reply_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
                     turn_id TEXT,
                     project TEXT NOT NULL,
@@ -115,7 +182,70 @@ class Store:
                 );
                 """
             )
+            self._migrate_last_reply(connection)
             self._migrate_session_scope(connection)
+
+    @staticmethod
+    def _migrate_last_reply(connection: sqlite3.Connection) -> None:
+        """Convert the old singleton reply row into the bounded history table."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(last_reply)").fetchall()
+        }
+        if "singleton" in columns:
+            connection.execute(
+                """
+                CREATE TABLE last_reply_new (
+                    reply_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    project TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO last_reply_new(session_id, turn_id, project, model, content, created_at)
+                SELECT session_id, turn_id, project, model, content, created_at
+                FROM last_reply
+                """
+            )
+            connection.execute("DROP TABLE last_reply")
+            connection.execute("ALTER TABLE last_reply_new RENAME TO last_reply")
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS last_reply_recent
+                ON last_reply (created_at DESC, reply_id DESC)
+            """
+        )
+
+        connection.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (LAST_REPLY_SCHEMA_VERSION_KEY, LAST_REPLY_SCHEMA_VERSION),
+        )
+
+    def _cleanup_expired_content(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        now: float,
+    ) -> None:
+        """Remove full replies and queued payloads after their privacy TTL."""
+
+        connection.execute(
+            "DELETE FROM last_reply WHERE created_at < ?",
+            (now - self.last_reply_ttl,),
+        )
+        connection.execute(
+            "DELETE FROM outbox WHERE created_at < ?",
+            (now - self.outbox_ttl,),
+        )
 
     @staticmethod
     def _normalize_cwd(cwd: str) -> str:
@@ -285,6 +415,21 @@ class Store:
             )
             return
 
+    def _trim_last_replies(self, connection: sqlite3.Connection, session_id: str) -> None:
+        rows = connection.execute(
+            "SELECT reply_id FROM last_reply "
+            "WHERE session_id = ? ORDER BY created_at DESC, reply_id DESC LIMIT ?",
+            (session_id, self.last_reply_limit),
+        ).fetchall()
+        keep_ids = [int(row["reply_id"]) for row in rows]
+        if not keep_ids:
+            return
+        placeholders = ",".join("?" for _ in keep_ids)
+        connection.execute(
+            f"DELETE FROM last_reply WHERE session_id = ? AND reply_id NOT IN ({placeholders})",
+            (session_id, *keep_ids),
+        )
+
     def ingest_hook(self, event: dict[str, Any], host: HostProcess | None = None) -> bool:
         event_name = str(event.get("hook_event_name", ""))
         if event_name not in {
@@ -331,6 +476,10 @@ class Store:
             status = "running"
         elif event_name == "Stop":
             status = "completed"
+            # The bound user explicitly requests the complete final answer via
+            # proactive delivery and /last. Redacting token-like source-code
+            # variables here would silently corrupt that answer; privacy is
+            # instead bounded by the reply TTL and single-user QQ binding.
             answer = str(event.get("last_assistant_message") or "")
             if answer:
                 kind = "final_reply"
@@ -348,7 +497,8 @@ class Store:
         event_key = self._event_key(event, session_id=session_id)
         legacy_event_key = self._event_key(event)
         inserted = False
-        with self._connect() as connection:
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
             if host is not None:
                 connection.execute(
                     """
@@ -391,32 +541,29 @@ class Store:
                 (session_id, cwd, project, model, turn_id, effective_status, preview, now),
             )
 
-            if event_name == "Stop" and payload is not None:
+            existing_event = None
+            if kind and payload is not None:
+                existing_event = connection.execute(
+                    "SELECT 1 FROM outbox "
+                    "WHERE event_key = ? OR (event_key = ? AND session_id = ?) LIMIT 1",
+                    (event_key, legacy_event_key, session_id),
+                ).fetchone()
+
+            if event_name == "Stop" and payload is not None and existing_event is None:
                 connection.execute(
                     """
-                    INSERT INTO last_reply(singleton, session_id, turn_id, project, model, content, created_at)
-                    VALUES (1, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(singleton) DO UPDATE SET
-                        session_id = excluded.session_id,
-                        turn_id = excluded.turn_id,
-                        project = excluded.project,
-                        model = excluded.model,
-                        content = excluded.content,
-                        created_at = excluded.created_at
+                    INSERT INTO last_reply(session_id, turn_id, project, model, content, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (session_id, turn_id, project, model, payload["content"], now),
                 )
+                self._trim_last_replies(connection, session_id)
 
             if kind and payload is not None:
                 muted = connection.execute(
                     "SELECT value FROM settings WHERE key = 'muted'"
                 ).fetchone()
                 initial_state = "suppressed" if muted and muted["value"] == "1" else "pending"
-                existing_event = connection.execute(
-                    "SELECT 1 FROM outbox "
-                    "WHERE event_key = ? OR (event_key = ? AND session_id = ?) LIMIT 1",
-                    (event_key, legacy_event_key, session_id),
-                ).fetchone()
                 if existing_event is None:
                     cursor = connection.execute(
                         """
@@ -443,12 +590,12 @@ class Store:
         return inserted
 
     def get_setting(self, key: str) -> str | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return str(row["value"]) if row else None
 
     def set_setting(self, key: str, value: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "INSERT INTO settings(key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -460,7 +607,7 @@ class Store:
         if not values:
             return
         placeholders = ",".join("?" for _ in values)
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(f"DELETE FROM settings WHERE key IN ({placeholders})", values)
 
     def set_daemon_info(self, pid: int, create_time: float) -> None:
@@ -482,7 +629,7 @@ class Store:
             self.delete_settings(["daemon"])
 
     def list_hosts(self) -> list[HostProcess]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT pid, create_time, kind FROM hosts ORDER BY last_seen DESC"
             ).fetchall()
@@ -492,7 +639,7 @@ class Store:
         values = [(host.pid, host.create_time) for host in hosts]
         if not values:
             return
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executemany("DELETE FROM hosts WHERE pid = ? AND create_time = ?", values)
 
     def get_bound_openid(self) -> str | None:
@@ -505,7 +652,7 @@ class Store:
     def consume_pairing(self, code: str, openid: str, *, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         supplied = hash_pairing_code(code)
-        with self._connect() as connection:
+        with self._connection() as connection:
             hash_row = connection.execute(
                 "SELECT value FROM settings WHERE key = 'pairing_hash'"
             ).fetchone()
@@ -554,7 +701,7 @@ class Store:
 
     def remember_inbound(self, message_id: str, *, now: float | None = None) -> bool:
         now = time.time() if now is None else now
-        with self._connect() as connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO inbound_messages(message_id, created_at) VALUES (?, ?)",
                 (message_id, now),
@@ -563,7 +710,8 @@ class Store:
 
     def get_due_outbox(self, *, now: float | None = None) -> OutboxItem | None:
         now = time.time() if now is None else now
-        with self._connect() as connection:
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
             row = connection.execute(
                 """
                 SELECT * FROM outbox
@@ -588,21 +736,21 @@ class Store:
         )
 
     def prepare_segments(self, item_id: int, segments: list[str]) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE outbox SET segments_json = ?, segment_index = 0 WHERE id = ?",
                 (json.dumps(segments, ensure_ascii=False), item_id),
             )
 
     def replace_segments(self, item_id: int, segments: list[str], index: int) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE outbox SET segments_json = ?, segment_index = ? WHERE id = ?",
                 (json.dumps(segments, ensure_ascii=False), index, item_id),
             )
 
     def advance_segment(self, item_id: int, current_index: int, total: int) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             if current_index + 1 >= total:
                 connection.execute(
                     "UPDATE outbox SET state = 'delivered', segment_index = ?, last_error = NULL WHERE id = ?",
@@ -616,7 +764,7 @@ class Store:
                 )
 
     def reschedule(self, item_id: int, *, delay: float, error: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE outbox
@@ -632,14 +780,14 @@ class Store:
     def mark_outbox(self, item_id: int, state: str, reason: str) -> None:
         if state not in {"delivered", "suppressed", "failed_permanent"}:
             raise ValueError(state)
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE outbox SET state = ?, last_error = ? WHERE id = ?",
                 (state, reason[:500], item_id),
             )
 
     def get_sessions_for_status(self) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             active = connection.execute(
                 """
                 SELECT * FROM sessions
@@ -652,15 +800,75 @@ class Store:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def get_last_reply(self) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            row = connection.execute("SELECT * FROM last_reply WHERE singleton = 1").fetchone()
+    def get_last_reply(
+        self,
+        *,
+        project: str | None = None,
+        session_id: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        now = time.time() if now is None else now
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
+            conditions: list[str] = []
+            parameters: list[object] = []
+            if project is not None:
+                conditions.append("project = ? COLLATE NOCASE")
+                parameters.append(project)
+            if session_id is not None:
+                conditions.append("session_id = ?")
+                parameters.append(session_id)
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            row = connection.execute(
+                f"SELECT * FROM last_reply {where} "
+                "ORDER BY created_at DESC, reply_id DESC LIMIT 1",
+                parameters,
+            ).fetchone()
         return dict(row) if row else None
+
+    def get_last_replies(
+        self,
+        *,
+        project: str | None = None,
+        session_id: str | None = None,
+        limit: int | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        now = time.time() if now is None else now
+        requested_limit = self.last_reply_limit if limit is None else max(1, min(int(limit), 1000))
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
+            conditions: list[str] = []
+            parameters: list[object] = []
+            if project is not None:
+                conditions.append("project = ? COLLATE NOCASE")
+                parameters.append(project)
+            if session_id is not None:
+                conditions.append("session_id = ?")
+                parameters.append(session_id)
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            rows = connection.execute(
+                f"SELECT * FROM last_reply {where} "
+                "ORDER BY created_at DESC, reply_id DESC LIMIT ?",
+                (*parameters, requested_limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_last_reply_projects(self, *, now: float | None = None) -> list[str]:
+        now = time.time() if now is None else now
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
+            rows = connection.execute(
+                "SELECT project, MAX(created_at) AS latest FROM last_reply "
+                "GROUP BY project ORDER BY latest DESC, project COLLATE NOCASE"
+            ).fetchall()
+        return [str(row["project"]) for row in rows]
 
     def cleanup(self, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         cutoff = now - 7 * 24 * 60 * 60
-        with self._connect() as connection:
+        with self._connection() as connection:
+            self._cleanup_expired_content(connection, now=now)
             connection.execute("DELETE FROM inbound_messages WHERE created_at < ?", (cutoff,))
             if not self._permission_notifications_enabled():
                 connection.execute(
@@ -668,8 +876,3 @@ class Store:
                     "WHERE state = 'pending' AND kind = 'permission_required'",
                     ("permission notifications disabled",),
                 )
-            connection.execute(
-                "DELETE FROM outbox "
-                "WHERE state IN ('delivered', 'suppressed', 'failed_permanent') AND created_at < ?",
-                (cutoff,),
-            )

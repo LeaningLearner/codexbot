@@ -10,20 +10,60 @@ from .locks import FileLock
 from .logging_utils import configure_logging
 from .paths import database_path, ensure_data_dir
 from .qq_client import run_qq_runtime
-from .security import load_credentials, redact_secrets
+from .security import Credentials, load_credentials, redact_secrets
 from .store import Store
 
 
-async def _wait_without_credentials(store: Store, logger: logging.Logger) -> None:
+CLEANUP_INTERVAL_SECONDS = 60.0 * 60.0
+
+
+async def _periodic_cleanup(
+    store: Store,
+    logger: logging.Logger,
+    stop_event: asyncio.Event,
+    *,
+    interval: float = CLEANUP_INTERVAL_SECONDS,
+) -> None:
+    """Run privacy cleanup periodically without doing SQLite work on the loop."""
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            continue
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            await asyncio.to_thread(store.cleanup)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            detail = redact_secrets(str(exc))[:300]
+            logger.error("Periodic store cleanup failed: %s: %s", type(exc).__name__, detail)
+
+
+async def _wait_without_credentials(
+    store: Store,
+    logger: logging.Logger,
+    *,
+    poll_interval: float = 1.0,
+) -> Credentials | None:
+    """Wait for credentials while the Codex hosts that spawned us are alive."""
+
     empty_checks = 0
     while True:
+        credentials = load_credentials()
+        if credentials is not None:
+            logger.info("QQ credentials became available; starting companion")
+            return credentials
+
         hosts = store.list_hosts()
         dead = []
         for host in hosts:
             try:
                 process = psutil.Process(host.pid)
                 alive = process.is_running() and abs(process.create_time() - host.create_time) <= 0.25
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
                 alive = False
             if not alive:
                 dead.append(host)
@@ -35,8 +75,36 @@ async def _wait_without_credentials(store: Store, logger: logging.Logger) -> Non
             empty_checks += 1
             if empty_checks >= 2:
                 logger.info("No Codex host remains; stopping companion")
-                return
-        await asyncio.sleep(1.0)
+                return None
+        await asyncio.sleep(poll_interval)
+
+
+async def _run_active_daemon(
+    store: Store,
+    logger: logging.Logger,
+    *,
+    cleanup_interval: float = CLEANUP_INTERVAL_SECONDS,
+) -> None:
+    cleanup_stop = asyncio.Event()
+    cleanup_task = asyncio.create_task(
+        _periodic_cleanup(
+            store,
+            logger,
+            cleanup_stop,
+            interval=cleanup_interval,
+        ),
+        name="codexbot-store-cleanup",
+    )
+    try:
+        credentials = load_credentials()
+        if credentials is None:
+            logger.error("QQ credentials are missing; run install.cmd or codexbot setup")
+            credentials = await _wait_without_credentials(store, logger)
+        if credentials is not None:
+            await run_qq_runtime(store, credentials, logger)
+    finally:
+        cleanup_stop.set()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
 
 
 def main() -> int:
@@ -50,18 +118,14 @@ def main() -> int:
     try:
         try:
             created = psutil.Process(os.getpid()).create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             created = 0.0
         store.set_daemon_info(os.getpid(), created)
         store.cleanup()
-        credentials = load_credentials()
-        if credentials is None:
-            logger.error("QQ credentials are missing; run install.cmd or codexbot setup")
-            asyncio.run(_wait_without_credentials(store, logger))
-        else:
-            asyncio.run(run_qq_runtime(store, credentials, logger))
+        asyncio.run(_run_active_daemon(store, logger))
     except Exception as exc:
-        logger.exception("Companion stopped unexpectedly: %s", redact_secrets(str(exc))[:300])
+        detail = redact_secrets(str(exc))[:300]
+        logger.error("Companion stopped unexpectedly: %s: %s", type(exc).__name__, detail)
         return 1
     finally:
         store.clear_daemon_info(os.getpid())

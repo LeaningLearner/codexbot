@@ -38,14 +38,17 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 - 权限提醒：默认关闭，显式开启后才通知人工确认请求；自动审查不会默认制造“等待人工审批”的噪音。
 - 多窗口支持：多个 Codex 窗口和多个项目共享一个 daemon 与消息队列，会话按 `session_id + 工作目录` 隔离。
 - 可靠投递：SQLite WAL、本地 outbox、速率限制、重试、分段和永久错误处理。
-- 隐私保护：AppSecret 存放在 Windows Credential Manager；提示词、回复和日志中的常见密钥会脱敏。
+- Codex 账号与用量：通过本机 app-server 读取账号/套餐和所有限额 bucket；支持设备码登录切换，并显示限额剩余百分比、窗口和重置时间。
+- 隐私保护：AppSecret 存放在 Windows Credential Manager；提示词预览、错误和日志中的常见密钥会脱敏。
+- 账号安全：设备码登录只通过 `codex app-server` JSON-RPC 完成，不读取或复制 `~/.codex/auth.json`，不把 access token 写入数据库、日志或 QQ。
 - 只读设计：不调用 OpenAI API，不创建第二个 Codex/ChatGPT 会话，也不从 QQ 远程执行命令。
 
 ### 环境要求
 
-- Windows 10 或 Windows 11。
+- Windows 10 或 Windows 11（x64；当前哈希锁固定为 `win_amd64` wheel）。
 - Python 3.11.x。项目要求 `>=3.11,<3.12`，安装器会优先查找 `py -3.11`。
 - 已安装并能正常运行的 Codex Desktop 或 Codex CLI，且支持 Codex Plugins / Lifecycle Hooks。
+- `/usage`、`/codex_account` 和 `/codex_login` 已在 Codex CLI 0.146.0 验证；缺少 app-server auth endpoint 的旧版会显示降级提示。
 - 一个 QQ 官方机器人沙箱应用，并取得 AppID、AppSecret；需要在 QQ 开放平台启用私聊事件和主动消息能力。
 - 你的 QQ 账号已经加入该机器人沙箱。
 - 安装依赖和运行通知时需要网络；不需要 OpenAI API Key。
@@ -95,7 +98,10 @@ cd codexbot
 | --- | --- |
 | `/bind XXXX-XXXX` | 使用一次性配对码绑定 QQ 用户 |
 | `/status` | 查看最近的 Codex 项目、模型和状态 |
-| `/last [页码]` | 分页读取最近一次完整回复 |
+| `/last [项目] [页码]` | 分页读取最近回复；不写项目时保持全局最近一次，单独写数字仍表示页码 |
+| `/usage` | 查看所有限额 bucket 的剩余百分比、窗口和重置时间；不支持时给出用量面板链接 |
+| `/codex_account` | 查看 Codex 邮箱、套餐和认证类型 |
+| `/codex_login` | 启动设备码登录；返回 `verificationUrl` 和 `userCode`，完成后主动回报 |
 | `/mute` | 暂停未来的主动通知，不补发静音期间的旧消息 |
 | `/unmute` | 恢复未来的主动通知 |
 | `/help` | 查看帮助 |
@@ -119,7 +125,7 @@ cd codexbot
 - 默认都使用 `%LOCALAPPDATA%\CodexBot` 下的同一个 SQLite 数据库。
 - `daemon.lock` 保证同一数据目录只运行一个 QQ daemon，避免同一机器人建立多个连接。
 - 所有项目的事件进入同一个本地 outbox，但会话键包含工作目录，不会因为重复的 `session_id` 覆盖其他项目。
-- QQ 绑定、静音状态和 `/last` 的“最近一次回复”是全局设置；通知正文会带项目名。
+- QQ 绑定和静音状态仍是全局设置；`/last` 默认是所有项目的最近回复，也可以使用 `/last 项目名 [页码]` 选择项目。回复按 session 保留有限历史，并受默认 7 天隐私 TTL 约束。
 
 如果多个项目使用同一 QQ 机器人，请不要为每个项目设置不同的 `CODEXBOT_DATA_DIR`。不同数据目录会绕过共享锁，可能启动多个 daemon。
 
@@ -132,6 +138,10 @@ cd codexbot
 - `runtime\`：CodexBot 专用 Python 环境。
 
 请不要提交 AppSecret、Access Token、SQLite 数据库或日志。如果凭据曾经出现在公开仓库、截图或日志中，请立即在 QQ 开放平台重新生成。
+
+为保证 `/last` 和最终通知确实是“完整回复”，CodexBot 会把最终回复原文保存在本机数据库并发送给已绑定的唯一 QQ 用户，不会改写其中看起来像 token 的代码。最终回复默认 7 天后清理；仍请避免让 Codex 在回复中输出真实密钥。
+
+`/usage` 在未登录、API key 或旧版 Codex 时会清晰降级，并提供官方用量面板：<https://chatgpt.com/codex/settings/usage>。这些账号与限额查询不会启动模型推理，因此不会额外消耗 Codex 推理 token。设备码登录期间 app-server 子进程由 CodexBot 独占管理，完成、失败、取消、超时和 daemon 退出都会清理。账号切换更新的是本机 Codex 的共享登录状态；如果已经打开的 Codex 窗口没有立即更新，请重启该窗口。
 
 ### 截图
 
@@ -151,6 +161,9 @@ py -3.11 -m venv .venv
 ### 相关文档
 
 - [Codex Hooks](https://developers.openai.com/codex/hooks/)
+- [Codex app-server](https://developers.openai.com/codex/app-server/)
+- [Codex authentication](https://developers.openai.com/codex/auth/)
+- [Codex CLI](https://developers.openai.com/codex/cli/)
 - [Codex Plugins](https://developers.openai.com/plugins/build/plugins)
 - [QQ BotPy](https://github.com/tencent-connect/botpy)
 - [QQ 消息频控](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/overview.html)
@@ -174,14 +187,18 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 - Optional permission reminders, disabled by default to keep automatic-review noise out of QQ.
 - Multiple Codex windows and projects supported by one daemon and one local outbox, with sessions scoped by `session_id + working directory`.
 - SQLite WAL, retries, rate limiting, adaptive message splitting, and permanent-error handling.
+- Codex account and usage commands through the local app-server: account/plan/authentication details, every rate-limit bucket, remaining percentage, window, and reset time.
 - AppSecret stored in Windows Credential Manager; common secrets are redacted from previews, errors, and logs.
+- Device-code account switching uses only the stable app-server JSON-RPC endpoints. CodexBot never reads or copies `~/.codex/auth.json`, and never writes access tokens to SQLite, logs, or QQ.
+- Full replies and queued notification payloads are retained locally for at most 7 days by default; `CODEXBOT_LAST_REPLY_TTL_SECONDS` and `CODEXBOT_OUTBOX_TTL_SECONDS` can override that window.
 - Read-only by design: no OpenAI API calls, no second Codex/ChatGPT session, and no remote command execution from QQ.
 
 ### Requirements
 
-- Windows 10 or Windows 11.
+- Windows 10 or Windows 11 on x64; the current hash lock pins `win_amd64` wheels.
 - Python 3.11.x. The package requires `>=3.11,<3.12`.
 - A working Codex Desktop or Codex CLI installation with Codex Plugins / Lifecycle Hooks support.
+- `/usage`, `/codex_account`, and `/codex_login` are verified with Codex CLI 0.146.0; older builds without the app-server auth endpoints show a graceful fallback.
 - An official QQ Bot sandbox application with an AppID and AppSecret, with private-message events and proactive messaging enabled.
 - Your QQ account added to the bot sandbox.
 - Network access for installation and QQ delivery. An OpenAI API key is not required.
@@ -216,7 +233,10 @@ Regenerate a pairing code with:
 | --- | --- |
 | `/bind XXXX-XXXX` | Bind the QQ user with a one-time pairing code |
 | `/status` | Show recent Codex projects, models, and states |
-| `/last [page]` | Read the most recent complete reply page by page |
+| `/last [project] [page]` | Read the latest reply page by page; omitting the project keeps the global-latest behavior, and a lone number remains a page number |
+| `/usage` | Show every rate-limit bucket's remaining percentage, window, and reset time, with a dashboard fallback |
+| `/codex_account` | Show the Codex email, plan, and authentication type |
+| `/codex_login` | Start device-code login; returns `verificationUrl` and `userCode`, then reports completion proactively |
 | `/mute` | Pause future proactive notifications without backfilling old ones |
 | `/unmute` | Resume future proactive notifications |
 | `/help` | Show the command help |
@@ -233,11 +253,21 @@ Permission reminders are informational only; QQ cannot approve the operation for
 
 Multiple Codex windows can run different projects at the same time. The default shared data directory is `%LOCALAPPDATA%\CodexBot`; `daemon.lock` keeps one QQ daemon per data directory, and the outbox stores events from all projects while scoping sessions by their working directory.
 
-Binding, mute state, and `/last` are global to the paired bot. If multiple projects use the same QQ bot, keep the default shared `CODEXBOT_DATA_DIR`; separate data directories can start separate daemons and cause duplicate QQ connections.
+Binding and mute state are global to the paired bot. `/last` defaults to the newest reply across projects but accepts `/last project [page]`; replies are retained in bounded per-session history and expire under the default seven-day privacy TTL. If multiple projects use the same QQ bot, keep the default shared `CODEXBOT_DATA_DIR`; separate data directories can start separate daemons and cause duplicate QQ connections.
 
 ### Privacy and local data
 
-Runtime data is stored under `%LOCALAPPDATA%\CodexBot`. Credentials stay in Windows Credential Manager. Prompt previews, errors, and logs are redacted where possible. Do not commit credentials, access tokens, SQLite state, or logs.
+Runtime data is stored under `%LOCALAPPDATA%\CodexBot`. QQ credentials stay in Windows Credential Manager. Prompt previews, CLI errors, and logs redact common secrets where possible. Do not commit credentials, access tokens, SQLite state, or logs. When ChatGPT authentication is unavailable, `/usage` links to <https://chatgpt.com/codex/settings/usage>; it does not fall back to reading `auth.json`.
+
+To keep `/last` and final notifications complete, CodexBot stores the final reply verbatim in the local database and sends it only to the single bound QQ user; it does not rewrite token-like source-code variables. Final replies expire after seven days by default, but you should still avoid asking Codex to print real secrets.
+
+Account and rate-limit reads do not start model inference and therefore add no Codex inference-token usage. Device-code login keeps one local app-server child alive until the matching `account/login/completed` notification arrives. A mismatched `loginId`, timeout, cancellation, failure, or daemon shutdown terminates and cleans up the child. The switch updates Codex's shared local login; restart an already-open Codex window if it does not refresh immediately.
+
+### Related documentation
+
+- [Codex app-server](https://developers.openai.com/codex/app-server/)
+- [Codex authentication](https://developers.openai.com/codex/auth/)
+- [Codex CLI](https://developers.openai.com/codex/cli/)
 
 ### Development
 
