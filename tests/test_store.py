@@ -80,6 +80,97 @@ def test_hook_ingestion_redacts_deduplicates_and_keeps_full_final_reply(
     assert "approval-secret" not in disk_text
 
 
+def test_same_session_id_in_different_projects_stays_isolated(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    first = _event(
+        "UserPromptSubmit",
+        session_id="reused-session",
+        turn_id="reused-turn",
+        cwd=r"D:\work\project-one",
+        prompt="same prompt",
+    )
+    second = _event(
+        "UserPromptSubmit",
+        session_id="reused-session",
+        turn_id="reused-turn",
+        cwd=r"E:\work\project-two",
+        prompt="same prompt",
+    )
+
+    assert store.ingest_hook(first) is True
+    assert store.ingest_hook(second) is True
+
+    sessions = _rows(
+        store.path,
+        "SELECT session_id, cwd, project FROM sessions ORDER BY cwd",
+    )
+    assert len(sessions) == 2
+    assert [row["project"] for row in sessions] == ["project-one", "project-two"]
+    assert sessions[0]["session_id"] != sessions[1]["session_id"]
+
+    outbox = _rows(store.path, "SELECT session_id FROM outbox ORDER BY id")
+    assert len(outbox) == 2
+    assert outbox[0]["session_id"] != outbox[1]["session_id"]
+
+
+def test_permission_resolution_is_scoped_to_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(PERMISSION_NOTIFICATION_ENV, "1")
+    store = Store(tmp_path / "state.sqlite3")
+    common = {
+        "session_id": "reused-session",
+        "turn_id": "reused-turn",
+        "tool_use_id": "reused-call",
+        "tool_name": "shell_command",
+        "tool_input": {"description": "same operation"},
+    }
+
+    assert store.ingest_hook(_event("PermissionRequest", cwd=r"D:\work\project-one", **common))
+    assert store.ingest_hook(_event("PermissionRequest", cwd=r"E:\work\project-two", **common))
+    assert not store.ingest_hook(
+        _event(
+            "PostToolUse",
+            cwd=r"E:\work\project-two",
+            session_id="reused-session",
+            turn_id="reused-turn",
+            tool_use_id="reused-call",
+            tool_name="shell_command",
+        )
+    )
+
+    states = _rows(store.path, "SELECT state FROM outbox ORDER BY id")
+    assert [row["state"] for row in states] == ["pending", "suppressed"]
+
+
+def test_existing_session_state_is_migrated_and_still_deduplicates(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    event = _event(
+        "UserPromptSubmit",
+        session_id="legacy-session",
+        cwd=r"D:\work\legacy-project",
+        prompt="legacy prompt",
+    )
+    store = Store(database)
+    assert store.ingest_hook(event)
+    legacy_event_key = Store._event_key(event)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE sessions SET session_id = 'legacy-session'")
+        connection.execute(
+            "UPDATE outbox SET session_id = 'legacy-session', event_key = ?",
+            (legacy_event_key,),
+        )
+        connection.execute(
+            "DELETE FROM settings WHERE key = 'session_scope_version'"
+        )
+
+    migrated = Store(database)
+    assert not migrated.ingest_hook(event)
+    sessions = _rows(database, "SELECT session_id FROM sessions")
+    assert len(sessions) == 1
+    assert str(sessions[0]["session_id"]).startswith("v2:")
+    assert _rows(database, "SELECT COUNT(*) AS count FROM outbox")[0]["count"] == 1
+
+
 def test_pairing_expiry_binding_and_prebinding_suppression(tmp_path: Path) -> None:
     store = Store(tmp_path / "state.sqlite3")
     store.ingest_hook(_event("UserPromptSubmit", prompt="任务"))

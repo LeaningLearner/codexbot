@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import hmac
 import json
+import ntpath
 import os
 from pathlib import Path, PureWindowsPath
 import sqlite3
@@ -16,6 +17,9 @@ from .security import hash_pairing_code, prompt_preview, redact_secrets
 
 PERMISSION_NOTIFICATION_DELAY = 5.0
 PERMISSION_NOTIFICATION_ENV = "CODEXBOT_NOTIFY_PERMISSION_REQUESTS"
+SESSION_SCOPE_VERSION = "2"
+SESSION_SCOPE_VERSION_KEY = "session_scope_version"
+SESSION_KEY_PREFIX = "v2:"
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,9 @@ class Store:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
+            journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+            if not journal_mode or str(journal_mode[0]).casefold() != "wal":
+                connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -109,6 +115,75 @@ class Store:
                 );
                 """
             )
+            self._migrate_session_scope(connection)
+
+    @staticmethod
+    def _normalize_cwd(cwd: str) -> str:
+        value = str(cwd or "").strip()
+        if not value:
+            return ""
+        return ntpath.normcase(ntpath.normpath(value))
+
+    @classmethod
+    def _scoped_session_id(
+        cls,
+        session_id: object,
+        cwd: str,
+        host: HostProcess | None = None,
+    ) -> str:
+        raw_session_id = str(session_id or "").strip() or "unknown"
+        scope = cls._normalize_cwd(cwd)
+        if not scope and raw_session_id == "unknown" and host is not None:
+            scope = f"host:{host.pid}:{host.create_time:.6f}"
+        identity = json.dumps(
+            {"cwd": scope, "session": raw_session_id},
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+        return SESSION_KEY_PREFIX + sha256(identity).hexdigest()
+
+    @classmethod
+    def _migrate_session_scope(cls, connection: sqlite3.Connection) -> None:
+        version = connection.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (SESSION_SCOPE_VERSION_KEY,),
+        ).fetchone()
+        if version and str(version["value"]) == SESSION_SCOPE_VERSION:
+            return
+
+        rows = connection.execute("SELECT session_id, cwd FROM sessions").fetchall()
+        mapping: dict[str, str] = {}
+        for row in rows:
+            old_session_id = str(row["session_id"])
+            if old_session_id.startswith(SESSION_KEY_PREFIX):
+                mapping[old_session_id] = old_session_id
+            else:
+                mapping[old_session_id] = cls._scoped_session_id(
+                    old_session_id,
+                    str(row["cwd"] or ""),
+                )
+
+        for old_session_id, new_session_id in mapping.items():
+            if old_session_id == new_session_id:
+                continue
+            connection.execute(
+                "UPDATE sessions SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            connection.execute(
+                "UPDATE outbox SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+            connection.execute(
+                "UPDATE last_reply SET session_id = ? WHERE session_id = ?",
+                (new_session_id, old_session_id),
+            )
+
+        connection.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SESSION_SCOPE_VERSION_KEY, SESSION_SCOPE_VERSION),
+        )
 
     @staticmethod
     def _project_name(cwd: str) -> str:
@@ -119,11 +194,11 @@ class Store:
         return Path(cwd).name or cwd
 
     @staticmethod
-    def _event_key(event: dict[str, Any]) -> str:
+    def _event_key(event: dict[str, Any], *, session_id: str | None = None) -> str:
         event_name = str(event.get("hook_event_name", ""))
         identity: dict[str, Any] = {
             "event": event_name,
-            "session": event.get("session_id"),
+            "session": event.get("session_id") if session_id is None else session_id,
             "turn": event.get("turn_id"),
         }
         if event_name == "PermissionRequest":
@@ -223,10 +298,11 @@ class Store:
             raise ValueError(f"unsupported hook event: {event_name}")
 
         now = time.time()
-        session_id = str(event.get("session_id") or "unknown")
+        raw_session_id = str(event.get("session_id") or "unknown")
         turn_id = str(event["turn_id"]) if event.get("turn_id") is not None else None
         cwd = str(event.get("cwd") or "")
         project = self._project_name(cwd)
+        session_id = self._scoped_session_id(raw_session_id, cwd, host)
         model = str(event.get("model") or "unknown")
         status = "idle"
         preview: str | None = None
@@ -269,7 +345,8 @@ class Store:
         elif event_name == "SessionStart" and str(event.get("source") or "") == "compact":
             status = "preserve"
 
-        event_key = self._event_key(event)
+        event_key = self._event_key(event, session_id=session_id)
+        legacy_event_key = self._event_key(event)
         inserted = False
         with self._connect() as connection:
             if host is not None:
@@ -335,28 +412,34 @@ class Store:
                     "SELECT value FROM settings WHERE key = 'muted'"
                 ).fetchone()
                 initial_state = "suppressed" if muted and muted["value"] == "1" else "pending"
-                cursor = connection.execute(
-                    """
-                    INSERT OR IGNORE INTO outbox(
-                        event_key, kind, session_id, turn_id, payload_json, state, created_at,
-                        next_attempt_at, last_error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        event_key,
-                        kind,
-                        session_id,
-                        turn_id,
-                        json.dumps(payload, ensure_ascii=False),
-                        initial_state,
-                        now,
-                        now + PERMISSION_NOTIFICATION_DELAY
-                        if kind == "permission_required" and initial_state == "pending"
-                        else 0,
-                        "notifications muted" if initial_state == "suppressed" else None,
-                    ),
-                )
-                inserted = cursor.rowcount == 1
+                existing_event = connection.execute(
+                    "SELECT 1 FROM outbox "
+                    "WHERE event_key = ? OR (event_key = ? AND session_id = ?) LIMIT 1",
+                    (event_key, legacy_event_key, session_id),
+                ).fetchone()
+                if existing_event is None:
+                    cursor = connection.execute(
+                        """
+                        INSERT OR IGNORE INTO outbox(
+                            event_key, kind, session_id, turn_id, payload_json, state, created_at,
+                            next_attempt_at, last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_key,
+                            kind,
+                            session_id,
+                            turn_id,
+                            json.dumps(payload, ensure_ascii=False),
+                            initial_state,
+                            now,
+                            now + PERMISSION_NOTIFICATION_DELAY
+                            if kind == "permission_required" and initial_state == "pending"
+                            else 0,
+                            "notifications muted" if initial_state == "suppressed" else None,
+                        ),
+                    )
+                    inserted = cursor.rowcount == 1
         return inserted
 
     def get_setting(self, key: str) -> str | None:
