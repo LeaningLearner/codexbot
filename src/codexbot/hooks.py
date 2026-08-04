@@ -17,6 +17,7 @@ def process_hook(payload: dict[str, object], store: Store) -> bool:
     if (
         payload.get("hook_event_name") != "SessionEnd"
         and os.environ.get("CODEXBOT_DISABLE_DAEMON") != "1"
+        and host is not None
     ):
         ensure_daemon(store)
     return inserted
@@ -27,7 +28,9 @@ def main() -> int:
     logger = configure_logging("codexbot.hooks")
     try:
         raw = sys.stdin.buffer.read()
-        payload = json.loads(raw.decode("utf-8"))
+        # Some Windows hook runners prepend a UTF-8 BOM.  Treat it as an
+        # encoding marker instead of dropping the whole lifecycle event.
+        payload = json.loads(raw.decode("utf-8-sig"))
         if not isinstance(payload, dict):
             raise ValueError("hook payload must be a JSON object")
         process_hook(payload, Store(database_path()))

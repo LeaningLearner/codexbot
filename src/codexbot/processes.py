@@ -57,7 +57,15 @@ def _process_stem(value: str) -> str:
 
 def _looks_like_codex_name(value: str) -> bool:
     stem = _process_stem(value)
-    return stem == "codex" or stem.startswith(("codex-", "codex_"))
+    # Recent Codex Desktop builds run hook-owning sessions under the
+    # ``luna_worker`` executable instead of exposing a codex-named parent.
+    # Treat both spellings as Codex hosts so the daemon follows the actual
+    # worker that emitted the hook.
+    return (
+        stem == "codex"
+        or stem.startswith(("codex-", "codex_"))
+        or stem in {"luna_worker", "luna-worker"}
+    )
 
 
 def _looks_like_codex_process(item: ProcessInfo) -> bool:
@@ -112,6 +120,63 @@ def _snapshot(process: psutil.Process) -> ProcessInfo | None:
         return None
 
 
+def _iter_process_snapshots() -> Iterable[ProcessInfo]:
+    """Yield best-effort snapshots for every visible process on the machine."""
+
+    for process in psutil.process_iter(
+        ["pid", "create_time", "name", "exe", "cmdline"]
+    ):
+        try:
+            info = ProcessInfo(
+                pid=int(process.info["pid"]),
+                create_time=float(process.info["create_time"]),
+                name=str(process.info["name"] or ""),
+                executable=str(process.info["exe"] or ""),
+                command_line=tuple(
+                    str(argument) for argument in (process.info["cmdline"] or ())
+                ),
+            )
+        except (
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+        yield info
+
+
+def discover_codex_host_by_scan() -> HostProcess | None:
+    """Find a long-lived Codex host by scanning the process table.
+
+    Codex Desktop detaches hook workers (DETACHED_PROCESS) and the
+    intermediate powershell/pythonw bootstrap processes exit before the hook
+    handler starts, so psutil cannot walk from the hook process back to the
+    app.  When the parent chain is unavailable, scan for the app-server or the
+    desktop application instead; both stay alive for the whole Codex session.
+    The app-server is preferred because it is the process that owns the hooks;
+    desktop matching is intentionally a fallback since unrelated ChatGPT
+    applications can look similar in a full process-table scan.
+    """
+
+    app_server: ProcessInfo | None = None
+    desktop: ProcessInfo | None = None
+    for info in _iter_process_snapshots():
+        if _is_app_server(info):
+            if app_server is None:
+                app_server = info
+        elif _is_desktop_host(info):
+            if desktop is None:
+                desktop = info
+    if app_server is not None:
+        return HostProcess(app_server.pid, app_server.create_time, "app-server")
+    if desktop is not None:
+        return HostProcess(desktop.pid, desktop.create_time, "desktop")
+    return None
+
+
 def select_codex_host(chain: Iterable[ProcessInfo]) -> HostProcess | None:
     """Select the nearest useful Codex host from a child-to-parent chain.
 
@@ -152,9 +217,15 @@ def discover_codex_host(start_pid: int | None = None) -> HostProcess | None:
                 current = current.parent()
             except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
                 break
-        return select_codex_host(chain)
+        host = select_codex_host(chain)
     except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess, OSError):
-        return None
+        host = None
+    if host is not None:
+        return host
+    # The hook bootstrap detaches from its launcher, so the parent chain can
+    # already be gone before the handler runs.  Fall back to a process scan so
+    # the companion daemon still starts and follows the Codex host.
+    return discover_codex_host_by_scan()
 
 
 def process_matches(pid: int, create_time: float, *, tolerance: float = 0.25) -> bool:

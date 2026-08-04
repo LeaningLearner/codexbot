@@ -18,6 +18,15 @@ from .codex_login import (
     parse_account_result,
     parse_device_login_result,
 )
+from .codex_accounts import (
+    CodexAccount,
+    CodexAccountError,
+    CodexAccountManager,
+    CodexUsageError,
+    format_account_list,
+    format_saved_account_text,
+    format_saved_usage_text,
+)
 from .codex_usage import format_usage_text, parse_rate_limits, usage_dashboard_hint
 from .formatting import split_text
 from .security import redact_secrets
@@ -35,6 +44,8 @@ HELP_TEXT = (
     "/last [项目] [页码] - 查看最近回复；只写页码时保持兼容\n"
     "/usage - 查看 Codex 各限额剩余百分比和重置时间\n"
     "/codex_account - 查看 Codex 邮箱、套餐和认证类型\n"
+    "/codex_accounts - 列出 codex_login 保存的账号\n"
+    "/codex_switch <序号|名称|ID> - 切换 codex_login 账号\n"
     "/codex_login - 启动 Codex 设备码登录/切换账号\n"
     "/mute - 暂停主动通知\n"
     "/unmute - 恢复主动通知\n"
@@ -91,6 +102,12 @@ def _codex_failure_text(action: str, exc: BaseException, *, dashboard: bool = Fa
         return "已有 Codex 账号切换正在进行，请稍后重试。"
     if isinstance(exc, AppServerTimeout):
         text = f"Codex {action}超时，请稍后重试。"
+    elif isinstance(exc, CodexUsageError) and exc.status == 401:
+        text = "Codex 登录凭据已过期，请在 codex_login 中重新登录后重试。"
+    elif isinstance(exc, CodexUsageError) and exc.status == 403:
+        text = "Codex 用量接口暂时拒绝了请求，可能是网络安全校验，请稍后重试。"
+    elif isinstance(exc, CodexUsageError):
+        text = f"Codex {action}暂时失败，请稍后重试。"
     elif _auth_required_error(exc):
         text = f"Codex {action}需要 ChatGPT 账号认证；当前可能未登录或使用 API key。"
     elif isinstance(exc, AppServerRPCError) and exc.code == -32601:
@@ -187,10 +204,13 @@ class CommandService:
         *,
         codex_client: Any | None = None,
         login_service: Any | None = None,
+        account_manager: Any | None = None,
         codex_timeout: float = 30.0,
     ) -> None:
         self.store = store
+        self._prefer_saved_accounts = codex_client is None or account_manager is not None
         self.codex_client = codex_client or CodexAppServerClient()
+        self.account_manager = account_manager or CodexAccountManager()
         # A device-code flow intentionally keeps its own app-server child and
         # RPC lock for several minutes; it must not block /usage or /codex_account.
         self.login_service = login_service or CodexLoginService()
@@ -198,6 +218,23 @@ class CommandService:
 
     async def _usage_text(self) -> str:
         try:
+            if self._prefer_saved_accounts:
+                saved_account = await _invoke_codex(
+                    self.account_manager.get_active_account,
+                    timeout=self.codex_timeout,
+                )
+                if isinstance(saved_account, CodexAccount):
+                    if not saved_account.is_chatgpt:
+                        return (
+                            "Codex 当前账号不是 ChatGPT OAuth 登录，无法直接读取限额。\n"
+                            f"{usage_dashboard_hint()}"
+                        )
+                    payload = await _invoke_codex(
+                        self.account_manager.read_usage,
+                        saved_account,
+                        timeout=self.codex_timeout,
+                    )
+                    return format_saved_usage_text(saved_account, payload)
             account = parse_account_result(
                 await _invoke_codex(
                     self.codex_client.read_account,
@@ -223,6 +260,13 @@ class CommandService:
 
     async def _account_text(self) -> str:
         try:
+            if self._prefer_saved_accounts:
+                saved_account = await _invoke_codex(
+                    self.account_manager.get_active_account,
+                    timeout=self.codex_timeout,
+                )
+                if isinstance(saved_account, CodexAccount):
+                    return format_saved_account_text(saved_account)
             account = parse_account_result(
                 await _invoke_codex(
                     self.codex_client.read_account,
@@ -232,6 +276,37 @@ class CommandService:
             return _account_text(account)
         except Exception as exc:
             return _codex_failure_text("账号读取", exc)
+
+    async def _accounts_text(self) -> str:
+        try:
+            manager = self.account_manager
+            accounts = await _invoke_codex(manager.list_accounts, timeout=self.codex_timeout)
+            store = await _invoke_codex(manager.load_store, timeout=self.codex_timeout)
+            return format_account_list(tuple(accounts), store.active_account_id)
+        except Exception as exc:
+            detail = redact_secrets(str(exc)).replace("\r", " ").replace("\n", " ")
+            detail = " ".join(detail.split())[:180]
+            return f"Codex 账号列表读取失败：{detail or '请稍后重试。'}"
+
+    async def _switch_text(self, selector: str) -> str:
+        try:
+            account = await _invoke_codex(
+                self.account_manager.switch_account,
+                selector,
+                timeout=self.codex_timeout,
+            )
+            return (
+                "Codex 账号已切换。\n"
+                f"名称：{_safe_field(account.name)}\n"
+                f"邮箱：{_safe_field(account.email)}\n"
+                "已更新本机 Codex auth.json；已打开的 Codex 窗口请重启后生效。"
+            )
+        except CodexAccountError as exc:
+            detail = redact_secrets(str(exc)).replace("\r", " ").replace("\n", " ")
+            detail = " ".join(detail.split())[:220]
+            return f"Codex 账号切换失败：{detail or '请稍后重试。'}"
+        except Exception:
+            return "Codex 账号切换失败，请稍后重试。"
 
     async def _login_text(
         self,
@@ -356,6 +431,11 @@ class CommandService:
             response = await self._usage_text()
         elif lower == "/codex_account":
             response = await self._account_text()
+        elif lower == "/codex_accounts":
+            response = await self._accounts_text()
+        elif lower == "/codex_switch" or lower.startswith("/codex_switch "):
+            selector = command[len("/codex_switch") :].strip()
+            response = "用法：/codex_switch 序号、名称或账号 ID" if not selector else await self._switch_text(selector)
         elif lower == "/codex_login":
             response = await self._login_text(
                 openid=openid,

@@ -39,17 +39,17 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 - 权限提醒：默认关闭，显式开启后才通知人工确认请求；自动审查不会默认制造“等待人工审批”的噪音。
 - 多窗口支持：多个 Codex 窗口和多个项目共享一个 daemon 与消息队列，会话按 `session_id + 工作目录` 隔离。
 - 可靠投递：SQLite WAL、本地 outbox、速率限制、重试、分段和永久错误处理。
-- Codex 账号与用量：通过本机 app-server 读取账号/套餐和所有限额 bucket；支持设备码登录切换，并显示限额剩余百分比、窗口和重置时间。
+- Codex 账号与用量：优先复用 `codex_login` 的 `~/.codex-switcher/accounts.json`，直接读取当前 ChatGPT OAuth 账号的用量；没有账号库时回退到本机 app-server。
 - 隐私保护：AppSecret 存放在 Windows Credential Manager；提示词预览、错误和日志中的常见密钥会脱敏。
-- 账号安全：设备码登录只通过 `codex app-server` JSON-RPC 完成，不读取或复制 `~/.codex/auth.json`，不把 access token 写入数据库、日志或 QQ。
-- 只读设计：不调用 OpenAI API，不创建第二个 Codex/ChatGPT 会话，也不从 QQ 远程执行命令。
+- 账号安全：access token 只在读取现有 Codex 凭据和请求官方用量接口时短暂保存在内存中，不写入 CodexBot 数据库、日志或 QQ；切换账号时更新 Codex 官方 `auth.json`，不复制凭据到 CodexBot 数据目录。
+- 只读设计：只读取官方账号/用量接口，不调用模型 API，不创建第二个 Codex/ChatGPT 会话，也不从 QQ 远程执行任意命令。
 
 ### 环境要求
 
 - Windows 10 或 Windows 11（x64；当前哈希锁固定为 `win_amd64` wheel）。
 - Python 3.11.x。项目要求 `>=3.11,<3.12`，安装器会优先查找 `py -3.11`。
 - 已安装并能正常运行的 Codex Desktop 或 Codex CLI，且支持 Codex Plugins / Lifecycle Hooks。
-- `/usage`、`/codex_account` 和 `/codex_login` 已在 Codex CLI 0.146.0 验证；缺少 app-server auth endpoint 的旧版会显示降级提示。
+- `/usage`、`/codex_account`、`/codex_accounts`、`/codex_switch` 和 `/codex_login` 已在 Codex CLI 0.146.0 验证；缺少 app-server auth endpoint 时，已有 `codex_login` 账号仍可通过官方 backend 用量接口读取。
 - 一个 QQ 官方机器人沙箱应用，并取得 AppID、AppSecret；需要在 QQ 开放平台启用私聊事件和主动消息能力。
 - 你的 QQ 账号已经加入该机器人沙箱。
 - 安装依赖和运行通知时需要网络；不需要 OpenAI API Key。
@@ -102,6 +102,8 @@ cd codexbot
 | `/last [项目] [页码]` | 分页读取最近回复；不写项目时保持全局最近一次，单独写数字仍表示页码 |
 | `/usage` | 查看所有限额 bucket 的剩余百分比、窗口和重置时间；不支持时给出用量面板链接 |
 | `/codex_account` | 查看 Codex 邮箱、套餐和认证类型 |
+| `/codex_accounts` | 列出 `codex_login` 保存的账号并标记当前账号 |
+| `/codex_switch <序号\|名称\|ID>` | 切换 `codex_login` 账号；切换前需要关闭正在运行的 Codex |
 | `/codex_login` | 启动设备码登录；返回 `verificationUrl` 和 `userCode`，完成后主动回报 |
 | `/mute` | 暂停未来的主动通知，不补发静音期间的旧消息 |
 | `/unmute` | 恢复未来的主动通知 |
@@ -143,7 +145,7 @@ cd codexbot
 
 为保证 `/last` 和最终通知确实是“完整回复”，CodexBot 会把最终回复原文保存在本机数据库并发送给已绑定的唯一 QQ 用户，不会改写其中看起来像 token 的代码。最终回复默认 7 天后清理；仍请避免让 Codex 在回复中输出真实密钥。
 
-`/usage` 在未登录、API key 或旧版 Codex 时会清晰降级，并提供官方用量面板：<https://chatgpt.com/codex/settings/usage>。这些账号与限额查询不会启动模型推理，因此不会额外消耗 Codex 推理 token。设备码登录期间 app-server 子进程由 CodexBot 独占管理，完成、失败、取消、超时和 daemon 退出都会清理。账号切换更新的是本机 Codex 的共享登录状态；如果已经打开的 Codex 窗口没有立即更新，请重启该窗口。
+`/usage` 会优先读取 `~/.codex-switcher/accounts.json` 当前账号的 OAuth token，并请求 `https://chatgpt.com/backend-api/wham/usage`；未登录、API key、网络失败或旧版返回不支持时会提供官方用量面板：<https://chatgpt.com/codex/settings/usage>。这些查询不会启动模型推理，因此不会额外消耗 Codex 推理 token。`/codex_switch` 会把选中账号写入 `CODEX_HOME\auth.json` 并同步 `accounts.json`；为避免覆盖正在使用的登录状态，检测到 Codex/ChatGPT 进程时会拒绝切换。切换后请重启已打开的 Codex 窗口。
 
 ### 截图
 
@@ -190,18 +192,18 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 - Optional permission reminders, disabled by default to keep automatic-review noise out of QQ.
 - Multiple Codex windows and projects supported by one daemon and one local outbox, with sessions scoped by `session_id + working directory`.
 - SQLite WAL, retries, rate limiting, adaptive message splitting, and permanent-error handling.
-- Codex account and usage commands through the local app-server: account/plan/authentication details, every rate-limit bucket, remaining percentage, window, and reset time.
+- Codex account and usage commands reuse `codex_login`'s `~/.codex-switcher/accounts.json` for direct ChatGPT backend usage reads, with the local app-server as a fallback.
 - AppSecret stored in Windows Credential Manager; common secrets are redacted from previews, errors, and logs.
-- Device-code account switching uses only the stable app-server JSON-RPC endpoints. CodexBot never reads or copies `~/.codex/auth.json`, and never writes access tokens to SQLite, logs, or QQ.
+- Access tokens are held only in memory while reading the existing Codex account store and official usage endpoint. They are never written to CodexBot's SQLite database, logs, or QQ; `/codex_switch` updates the official `CODEX_HOME\auth.json` and the switcher's active-account marker.
 - Full replies and queued notification payloads are retained locally for at most 7 days by default; `CODEXBOT_LAST_REPLY_TTL_SECONDS` and `CODEXBOT_OUTBOX_TTL_SECONDS` can override that window.
-- Read-only by design: no OpenAI API calls, no second Codex/ChatGPT session, and no remote command execution from QQ.
+- Read-only by design: only official account/usage reads, no model API calls, no second Codex/ChatGPT session, and no arbitrary remote command execution from QQ.
 
 ### Requirements
 
 - Windows 10 or Windows 11 on x64; the current hash lock pins `win_amd64` wheels.
 - Python 3.11.x. The package requires `>=3.11,<3.12`.
 - A working Codex Desktop or Codex CLI installation with Codex Plugins / Lifecycle Hooks support.
-- `/usage`, `/codex_account`, and `/codex_login` are verified with Codex CLI 0.146.0; older builds without the app-server auth endpoints show a graceful fallback.
+- `/usage`, `/codex_account`, `/codex_accounts`, `/codex_switch`, and `/codex_login` are verified with Codex CLI 0.146.0; the direct backend usage path still works when app-server auth endpoints are unavailable.
 - An official QQ Bot sandbox application with an AppID and AppSecret, with private-message events and proactive messaging enabled.
 - Your QQ account added to the bot sandbox.
 - Network access for installation and QQ delivery. An OpenAI API key is not required.
@@ -239,6 +241,8 @@ Regenerate a pairing code with:
 | `/last [project] [page]` | Read the latest reply page by page; omitting the project keeps the global-latest behavior, and a lone number remains a page number |
 | `/usage` | Show every rate-limit bucket's remaining percentage, window, and reset time, with a dashboard fallback |
 | `/codex_account` | Show the Codex email, plan, and authentication type |
+| `/codex_accounts` | List accounts saved by `codex_login` and mark the active account |
+| `/codex_switch <index\|name\|ID>` | Switch a saved `codex_login` account; Codex must be closed first |
 | `/codex_login` | Start device-code login; returns `verificationUrl` and `userCode`, then reports completion proactively |
 | `/mute` | Pause future proactive notifications without backfilling old ones |
 | `/unmute` | Resume future proactive notifications |
@@ -262,11 +266,11 @@ Binding and mute state are global to the paired bot. `/last` defaults to the new
 
 ### Privacy and local data
 
-Runtime data is stored under `%LOCALAPPDATA%\CodexBot`. QQ credentials stay in Windows Credential Manager. Prompt previews, CLI errors, and logs redact common secrets where possible. Do not commit credentials, access tokens, SQLite state, or logs. When ChatGPT authentication is unavailable, `/usage` links to <https://chatgpt.com/codex/settings/usage>; it does not fall back to reading `auth.json`.
+Runtime data is stored under `%LOCALAPPDATA%\CodexBot`. QQ credentials stay in Windows Credential Manager. Prompt previews, CLI errors, and logs redact common secrets where possible. Do not commit credentials, access tokens, SQLite state, or logs. `/usage` prefers the existing `~/.codex-switcher/accounts.json` OAuth account and falls back to <https://chatgpt.com/codex/settings/usage> when direct usage is unavailable.
 
 To keep `/last` and final notifications complete, CodexBot stores the final reply verbatim in the local database and sends it only to the single bound QQ user; it does not rewrite token-like source-code variables. Final replies expire after seven days by default, but you should still avoid asking Codex to print real secrets.
 
-Account and rate-limit reads do not start model inference and therefore add no Codex inference-token usage. Device-code login keeps one local app-server child alive until the matching `account/login/completed` notification arrives. A mismatched `loginId`, timeout, cancellation, failure, or daemon shutdown terminates and cleans up the child. The switch updates Codex's shared local login; restart an already-open Codex window if it does not refresh immediately.
+Account and rate-limit reads do not start model inference and therefore add no Codex inference-token usage. `/codex_switch` writes the selected account to `CODEX_HOME\auth.json` and updates the switcher's active-account marker; restart an already-open Codex window if it does not refresh immediately. Device-code login still keeps one local app-server child alive until the matching `account/login/completed` notification arrives, with cleanup on mismatch, timeout, cancellation, failure, or daemon shutdown.
 
 ### Related documentation
 

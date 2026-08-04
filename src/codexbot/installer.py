@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 from typing import Any
 
+from .paths import runtime_python
+
 
 PLUGIN_NAME = "codexbot"
 CODEX_PLUGIN_LIST_TIMEOUT_SECONDS = 15
@@ -158,6 +160,38 @@ def _cachebust_manifest(plugin_path: Path) -> str:
     manifest["version"] = version
     _write_json_atomic(manifest_path, manifest, backup=False)
     return version
+
+
+def _patch_windows_hook_command(hooks_path: Path, pythonw: Path) -> None:
+    """Point every Windows hook at the windowless pythonw bootstrap.
+
+    ``cmd.exe`` and ``powershell.exe`` are console applications: the Codex
+    app-server spawns hook commands without a console, so each hook briefly
+    opens a visible terminal window before it is hidden.  ``pythonw.exe`` is a
+    GUI-subsystem binary, so it never creates a console while still relaying
+    the hook JSON over the inherited stdin/stdout pipes.
+    """
+
+    document = _load_json(hooks_path)
+    hooks = document.get("hooks")
+    if not isinstance(hooks, dict):
+        raise RuntimeError(f"hooks.json 缺少 hooks 对象：{hooks_path}")
+    command = f'"{pythonw}" -E "${{PLUGIN_ROOT}}\\hooks\\entry.py"'
+    changed = False
+    for event_groups in hooks.values():
+        if not isinstance(event_groups, list):
+            continue
+        for group in event_groups:
+            entries = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if isinstance(entry, dict) and "commandWindows" in entry:
+                    entry["commandWindows"] = command
+                    changed = True
+    if not changed:
+        raise RuntimeError(f"hooks.json 没有可替换的 commandWindows：{hooks_path}")
+    _write_json_atomic(hooks_path, document, backup=False)
 
 
 def _remove_plugin_artifacts(plugin_path: Path) -> None:
@@ -539,6 +573,12 @@ def install_personal_plugin(
         # Build from an empty directory so source deletions remove target stale files.
         _copy_plugin_tree(source, staged_plugin)
         _cachebust_manifest(staged_plugin)
+        pythonw = runtime_python(windowed=True)
+        if pythonw.is_file():
+            _patch_windows_hook_command(
+                staged_plugin / "hooks" / "hooks.json",
+                pythonw,
+            )
         validate_plugin_tree(staged_plugin)
 
         if had_previous_plugin:

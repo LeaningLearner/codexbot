@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]
@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]
@@ -31,7 +31,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]
@@ -43,7 +43,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]
@@ -55,7 +55,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]
@@ -67,7 +67,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "cmd /d /s /c \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"${PLUGIN_ROOT}\\hooks\\entry.ps1\"",
             "timeout": 2
           }
         ]

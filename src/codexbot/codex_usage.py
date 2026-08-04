@@ -42,12 +42,18 @@ def _bucket(value: object, name: str) -> RateLimitBucket | None:
     raw = _as_mapping(value)
     used = _number(raw.get("usedPercent"))
     if used is None:
+        used = _number(raw.get("used_percent"))
+    if used is None:
         return None
     duration = _number(raw.get("windowDurationMins"))
     if duration is None:
         seconds = _number(raw.get("windowDurationSeconds"))
+        if seconds is None:
+            seconds = _number(raw.get("limit_window_seconds"))
         duration = seconds / 60.0 if seconds is not None else None
     reset = _number(raw.get("resetsAt"))
+    if reset is None:
+        reset = _number(raw.get("reset_at"))
     return RateLimitBucket(
         name=str(name),
         used_percent=max(0.0, min(100.0, used)),
@@ -140,6 +146,17 @@ def parse_rate_limits(payload: object) -> RateLimitSnapshot:
             buckets=buckets,
             seen=seen,
         )
+
+    # codex_login reads the ChatGPT backend directly. Its response uses the
+    # snake_case ``rate_limit.primary_window``/``secondary_window`` shape,
+    # rather than app-server's ``rateLimitsByLimitId`` shape.
+    backend_limits = _as_mapping(root.get("rate_limit") or root.get("rateLimit"))
+    for name, key in (("primary", "primary_window"), ("secondary", "secondary_window")):
+        window = backend_limits.get(key)
+        if not isinstance(window, Mapping):
+            window = backend_limits.get(name)
+        if isinstance(window, Mapping):
+            _add_bucket(buckets, seen, name, window)
 
     # Be tolerant of a result that is itself the rate-limit object.
     if not buckets:

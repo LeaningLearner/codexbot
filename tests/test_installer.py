@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+import codexbot.installer
 from codexbot.installer import install_personal_plugin, validate_plugin_tree
 
 
@@ -59,6 +60,52 @@ def test_installer_merges_marketplace_preserves_order_and_updates(tmp_path: Path
     assert second_manifest["version"] != manifest["version"]
     updated = json.loads(marketplace_path.read_text(encoding="utf-8"))
     assert [entry["name"] for entry in updated["plugins"]].count("codexbot") == 1
+
+
+def test_installer_points_windows_hooks_at_windowless_pythonw(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    pythonw = tmp_path / "runtime" / "Scripts" / "pythonw.exe"
+    pythonw.parent.mkdir(parents=True)
+    pythonw.write_bytes(b"")
+    monkeypatch.setattr(codexbot.installer, "runtime_python", lambda **_: pythonw)
+
+    result = install_personal_plugin(ROOT, home=home, run_codex=False)
+
+    hooks_document = json.loads(
+        (result.plugin_path / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )
+    expected = f'"{pythonw}" -E "${{PLUGIN_ROOT}}\\hooks\\entry.py"'
+    for event_groups in hooks_document["hooks"].values():
+        for group in event_groups:
+            for entry in group["hooks"]:
+                assert entry["commandWindows"] == expected
+                assert "powershell" not in entry["commandWindows"].casefold()
+                assert "cmd " not in entry["commandWindows"].casefold()
+
+    # The source tree keeps its portable fallback; only the installed copy is patched.
+    source_hooks = json.loads(
+        (ROOT / "plugin" / "codexbot" / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )
+    for event_groups in source_hooks["hooks"].values():
+        for group in event_groups:
+            for entry in group["hooks"]:
+                assert "powershell.exe" in entry["commandWindows"]
+
+
+def test_installer_keeps_fallback_when_pythonw_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    missing = tmp_path / "no-runtime" / "pythonw.exe"
+    monkeypatch.setattr(codexbot.installer, "runtime_python", lambda **_: missing)
+
+    result = install_personal_plugin(ROOT, home=home, run_codex=False)
+
+    hooks_document = json.loads(
+        (result.plugin_path / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )
+    for event_groups in hooks_document["hooks"].values():
+        for group in event_groups:
+            for entry in group["hooks"]:
+                assert "powershell.exe" in entry["commandWindows"]
 
 
 def test_installer_repairs_missing_marketplace_interface(tmp_path: Path) -> None:

@@ -8,6 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 
+import codexbot.hooks as hooks_module
+from codexbot.store import Store
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -177,3 +180,55 @@ def test_runtime_hook_writes_queue_and_returns_empty_json(tmp_path: Path) -> Non
     )
     assert prompt not in disk
     assert "hook-secret-value" not in disk
+
+
+def test_runtime_hook_accepts_utf8_bom(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment["CODEXBOT_DATA_DIR"] = str(tmp_path)
+    environment["CODEXBOT_DISABLE_DAEMON"] = "1"
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "session-bom",
+        "turn_id": "turn-bom",
+        "cwd": str(ROOT),
+        "model": "gpt-5.6-codex",
+        "prompt": "hello",
+    }
+    completed = subprocess.run(
+        [sys.executable, "-m", "codexbot.hooks"],
+        input=b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"),
+        capture_output=True,
+        env=environment,
+        timeout=5,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout.decode("utf-8")) == {}
+    assert Store(tmp_path / "state.sqlite3").get_due_outbox() is not None
+
+
+def test_hook_does_not_start_daemon_without_a_detected_host(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    monkeypatch.setattr(hooks_module, "discover_codex_host", lambda: None)
+    monkeypatch.setattr(
+        hooks_module,
+        "ensure_daemon",
+        lambda _store: (_ for _ in ()).throw(AssertionError("daemon should not start")),
+    )
+    monkeypatch.delenv("CODEXBOT_DISABLE_DAEMON", raising=False)
+
+    inserted = hooks_module.process_hook(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "session-no-host",
+            "cwd": str(tmp_path),
+            "model": "model",
+        },
+        store,
+    )
+
+    assert inserted is False
