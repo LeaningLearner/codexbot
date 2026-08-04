@@ -54,44 +54,100 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 - 你的 QQ 账号已经加入该机器人沙箱。
 - 安装依赖和运行通知时需要网络；不需要 OpenAI API Key。
 
-### 安装
+### QQ 开放平台：创建机器人沙箱应用
+
+QQ 开放平台的页面名称可能随版本更新而变化，下面按当前常见路径说明配置方法。
+
+1. 打开 [QQ 开放平台](https://q.qq.com/)，进入“机器人”页面，选择“去创建或管理我的 QQ 机器人”。
+
+   ![QQ 开放平台机器人入口](docs/images/qq/01-open-platform.png)
+
+2. 创建机器人应用，并在机器人详情的“开发设置”中查看 AppID 接入凭证。AppID 可以写入本地受保护配置；AppSecret 只能写入 Windows Credential Manager 或其他受保护的环境变量。
+
+   ![QQ 机器人开发设置](docs/images/qq/02-development-settings.png)
+
+3. 在“事件与回调配置”中按控制台提供的方式启用事件接收；本项目使用 QQ 官方 BotPy 沙箱能力，并通过一次性配对码限制可读取通知的 QQ 用户。
+
+4. 在沙箱成员设置中把接收通知的 QQ 号加入沙箱，并确认机器人可以对该 QQ 主动发送私聊消息。
+
+不要把真实 AppSecret、配对码、Access Token、QQ 号或 SQLite 数据库提交到 Git；如果凭据曾经出现在截图、日志或公开仓库中，应立即在 QQ 开放平台重新生成。
+
+### 安装（完整下载与安装流程）
+
+#### 1. 准备环境
+
+- Windows 10 或 Windows 11（x64）。
+- Python 3.11.x。如果尚未安装，请到 [python.org](https://www.python.org/downloads/release/python-3110/) 下载 Python 3.11 安装包，安装时勾选“Add python.exe to PATH”（保留默认的 py launcher）。安装器会优先查找 `py -3.11`。
+- Git（可选）：已安装 Git 时用下面的 `git clone` 下载；没有 Git 时可在 GitHub 仓库页面点击 Code → Download ZIP 下载并解压。
+- 已按上文在 QQ 开放平台创建机器人沙箱应用，并取得 AppID、AppSecret。
+- 你的 QQ 账号已经加入该机器人沙箱，且允许机器人主动发送私聊消息。
+
+#### 2. 下载源码
 
 在 PowerShell 或命令提示符中执行：
 
 ```bat
 git clone https://github.com/LeaningLearner/codexbot.git
 cd codexbot
+```
+
+使用 ZIP 下载时，进入解压后的 `codexbot` 目录即可。
+
+#### 3. 运行安装器
+
+```bat
 .\install.cmd
 ```
 
-安装器会完成以下工作：
+安装器会依次完成：
 
-1. 在 `%LOCALAPPDATA%\CodexBot\runtime` 创建隔离的 Python 3.11 环境。
-2. 安装锁定版本的依赖和 CodexBot。
-3. 将 QQ 凭据写入 Windows Credential Manager。
-4. 安装个人 Codex 插件并注册生命周期 Hooks。
-5. 生成一次性 QQ 配对码。
+1. `[1/4]` 在 `%LOCALAPPDATA%\CodexBot\runtime` 创建隔离的 Python 3.11 虚拟环境；已存在且版本正确时直接复用。
+2. `[2/4]` 按 `requirements.lock` 安装锁定版本（带哈希校验）的依赖，再安装 CodexBot 本身。
+3. `[3/4]` 配置 QQ 凭据并安装个人 Codex 插件：
+   - 若 Windows Credential Manager 中还没有 QQ 凭据，会提示输入 AppID 和 AppSecret（AppSecret 输入时不回显）；
+   - 已有凭据时继续使用；需要更换时执行 `.\install.cmd --replace-credentials`；
+   - 将插件复制到个人插件目录，合并 `~/.agents/plugins/marketplace.json`，并执行 `codex plugin add`。
+4. `[4/4]` 生成一次性 QQ 配对码，并提示下一步。
 
-安装完成后，重启 Codex，在 Codex 的 `/hooks` 页面检查并信任 `codexbot` Hooks。然后在 QQ 中向机器人发送安装器显示的命令：
+#### 4. 配对 QQ
+
+安装完成后：
+
+1. 重启 Codex。
+2. 在 Codex 中打开 `/hooks`，检查并信任 `codexbot` 的六个生命周期 Hook（SessionStart、UserPromptSubmit、PermissionRequest、PostToolUse、Stop、SessionEnd）。
+3. 打开任意 Codex 任务，使伴随进程启动。
+4. 用沙箱 QQ 私聊机器人发送安装器显示的配对命令：
 
 ```text
 /bind XXXX-XXXX
 ```
 
-配对码默认 30 分钟有效。需要重新生成时执行：
+配对码默认 30 分钟有效；过期后重新生成：
 
 ```bat
 .\codexbot.cmd pair
 ```
 
-### 检查安装状态
+#### 5. 检查安装状态
 
 ```bat
 .\codexbot.cmd doctor --offline
 .\codexbot.cmd doctor
 ```
 
-`--offline` 会跳过 QQ 网络认证；不带参数时会额外检查 QQ 沙箱 Gateway。
+`--offline` 跳过 QQ 网络认证；不带参数时会额外检查 QQ 沙箱 Gateway 连接。
+
+### 让 AI 帮你配置
+
+配置过程可以交给 AI 助手完成：在 Codex 中直接说“帮我安装并配置 CodexBot”，或把本 README 发给其他 AI 助手（如 ChatGPT）按步骤执行。
+
+1. **准备信息**：QQ 开放平台的 AppID，以及接收通知的 QQ 号。AppSecret 不需要提前告诉 AI。
+2. **下载安装**：AI 依次执行上面的下载和安装命令；到提示输入 AppID 时，你在终端直接输入。AppSecret 也由你在终端输入（不回显，不会进入 AI 对话记录）。
+3. **检查结果**：AI 运行 `.\codexbot.cmd doctor --offline` 并解读输出；发现问题会尝试修复或给出下一步。
+4. **配对**：AI 提示你重启 Codex、在 `/hooks` 信任 codexbot Hooks，并把配对码显示给你；你在 QQ 私聊发送 `/bind XXXX-XXXX`。
+5. **排查问题**：QQ 侧收不到通知时，把 `.\codexbot.cmd doctor` 的输出和 QQ 开放平台控制台截图发给 AI，它会对照上面的配置步骤逐项检查。
+
+注意：不要把 AppSecret 粘贴到 AI 对话中。AI 只能做本机安装、检查和配对；QQ 开放平台上的账号、沙箱成员和凭据生成/重置仍需你在控制台完成。
 
 ### QQ 命令
 
@@ -208,29 +264,106 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 - Your QQ account added to the bot sandbox.
 - Network access for installation and QQ delivery. An OpenAI API key is not required.
 
+### QQ Open Platform: create the bot application
+
+QQ Open Platform page names may change between releases; the steps below follow the common paths at the time of writing.
+
+1. Open [QQ Open Platform](https://q.qq.com/), go to the Bots page, and choose "create or manage my QQ bot".
+
+   ![QQ Open Platform bot entry](docs/images/qq/01-open-platform.png)
+
+2. Create a bot application and find the AppID credential under the bot's Development Settings. The AppID may be stored as a protected local configuration; the AppSecret must only be stored in Windows Credential Manager or another protected secret store.
+
+   ![QQ bot development settings](docs/images/qq/02-development-settings.png)
+
+3. Enable event receiving under Events & Callbacks as shown in the console. CodexBot uses the official QQ BotPy sandbox capability and limits notification readers to one QQ user bound with a one-time pairing code.
+
+4. In the sandbox member settings, add the QQ number that should receive notifications and confirm the bot may send proactive private messages to it.
+
+Never commit the real AppSecret, pairing codes, access tokens, QQ numbers, or SQLite databases. If a credential ever appears in a screenshot, log, or public repository, regenerate it in the QQ Open Platform immediately.
+
 ### Installation
+
+#### 1. Prerequisites
+
+- Windows 10 or Windows 11 on x64.
+- Python 3.11.x. If not installed, download it from [python.org](https://www.python.org/downloads/release/python-3110/) and tick "Add python.exe to PATH" (keep the default py launcher). The installer looks for `py -3.11` first.
+- Git (optional): with Git, use the `git clone` command below; without Git, download the repository ZIP (Code → Download ZIP) and extract it.
+- A QQ bot sandbox application with AppID/AppSecret, created as described above.
+- Your own QQ account added to the bot sandbox with proactive private messages allowed.
+
+#### 2. Download the source
 
 Run this from PowerShell or Command Prompt:
 
 ```bat
 git clone https://github.com/LeaningLearner/codexbot.git
 cd codexbot
+```
+
+When using the ZIP download, enter the extracted `codexbot` directory instead.
+
+#### 3. Run the installer
+
+```bat
 .\install.cmd
 ```
 
-The installer creates an isolated Python runtime, installs pinned dependencies, stores QQ credentials in Windows Credential Manager, installs the personal Codex plugin, and generates a one-time pairing code.
+The installer proceeds in four steps:
 
-Restart Codex, open `/hooks`, and trust the `codexbot` lifecycle hooks. Then send the pairing command shown by the installer to the QQ bot:
+1. `[1/4]` Creates an isolated Python 3.11 virtual environment at `%LOCALAPPDATA%\CodexBot\runtime`; reuses it when it already exists with the right version.
+2. `[2/4]` Installs pinned, hash-verified dependencies from `requirements.lock`, then CodexBot itself.
+3. `[3/4]` Stores QQ credentials and installs the personal Codex plugin:
+   - If no QQ credentials exist in Windows Credential Manager, it prompts for AppID and AppSecret (AppSecret input is not echoed);
+   - Existing credentials are kept unless you pass `--replace-credentials`;
+   - It copies the plugin to the personal plugin directory, merges `~/.agents/plugins/marketplace.json`, and runs `codex plugin add`.
+4. `[4/4]` Generates a one-time QQ pairing code and prints the next steps.
+
+To replace the QQ AppID/AppSecret later:
+
+```bat
+.\install.cmd --replace-credentials
+```
+
+#### 4. Pair with QQ
+
+After installation:
+
+1. Restart Codex.
+2. Open `/hooks` in Codex and trust the six `codexbot` lifecycle hooks (SessionStart, UserPromptSubmit, PermissionRequest, PostToolUse, Stop, SessionEnd).
+3. Open any Codex task so the companion process starts.
+4. Send the pairing command shown by the installer to the bot via sandbox QQ:
 
 ```text
 /bind XXXX-XXXX
 ```
 
-Regenerate a pairing code with:
+Pairing codes are valid for 30 minutes by default. Regenerate one with:
 
 ```bat
 .\codexbot.cmd pair
 ```
+
+#### 5. Verify installation
+
+```bat
+.\codexbot.cmd doctor --offline
+.\codexbot.cmd doctor
+```
+
+`--offline` skips the QQ network authentication; without it, the QQ sandbox Gateway is checked as well.
+
+### Let an AI assistant configure CodexBot
+
+You can delegate the setup to an AI assistant: say "install and configure CodexBot for me" inside Codex, or send this README to another assistant such as ChatGPT and follow its steps.
+
+1. **Prepare the inputs**: your QQ Open Platform AppID and the QQ number that should receive notifications. The AppSecret does not need to be shared with the AI.
+2. **Download and install**: the AI runs the download and installation commands above; when it prompts for the AppID, type it into the terminal yourself. Type the AppSecret there too (it is not echoed and never enters the AI conversation).
+3. **Check the result**: the AI runs `.\codexbot.cmd doctor --offline` and interprets the output, fixing issues or explaining the next step.
+4. **Pair**: the AI asks you to restart Codex and trust the codexbot hooks in `/hooks`, then shows you the pairing code; send `/bind XXXX-XXXX` to the bot in QQ.
+5. **Troubleshoot**: if notifications never arrive, paste the `.\codexbot.cmd doctor` output and QQ Open Platform console screenshots back to the AI so it can check each configuration step.
+
+Never paste the AppSecret into the AI conversation. The AI can only install, check, and pair locally; account management, sandbox members, and credential generation/reset on the QQ Open Platform remain yours to do in the console.
 
 ### Commands
 
