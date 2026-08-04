@@ -29,6 +29,9 @@ LAST_REPLY_SCHEMA_VERSION_KEY = "last_reply_schema_version"
 SESSION_SCOPE_VERSION = "2"
 SESSION_SCOPE_VERSION_KEY = "session_scope_version"
 SESSION_KEY_PREFIX = "v2:"
+SUBAGENT_LIFECYCLE_EVENTS = frozenset({"SubagentStart", "SubagentStop"})
+SUBAGENT_IDENTITY_FIELDS = ("agent_id", "agent_type", "agent_transcript_path")
+TRANSCRIPT_METADATA_MAX_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -430,8 +433,60 @@ class Store:
             (session_id, *keep_ids),
         )
 
+    @staticmethod
+    def _has_subagent_identity(event: dict[str, Any]) -> bool:
+        return any(
+            str(event.get(field) or "").strip()
+            for field in SUBAGENT_IDENTITY_FIELDS
+        )
+
+    @staticmethod
+    def _transcript_marks_subagent(event: dict[str, Any]) -> bool:
+        """Read only bounded session metadata from Codex's transcript.
+
+        Current Codex subagent transcripts explicitly identify
+        ``thread_source: subagent`` in their first ``session_meta`` record.
+        The transcript format is not a stable API, so malformed, missing, or
+        future formats fail open and fall back to explicit hook fields.
+        """
+
+        raw_path = event.get("transcript_path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return False
+        try:
+            with Path(raw_path).open("rb") as handle:
+                line = handle.readline(TRANSCRIPT_METADATA_MAX_BYTES + 1)
+            if not line or len(line) > TRANSCRIPT_METADATA_MAX_BYTES:
+                return False
+            record = json.loads(line.decode("utf-8-sig"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if not isinstance(record, dict) or record.get("type") != "session_meta":
+            return False
+        metadata = record.get("payload")
+        if not isinstance(metadata, dict):
+            return False
+        source = metadata.get("source")
+        source_is_subagent = isinstance(source, dict) and "subagent" in source
+        return (
+            str(metadata.get("thread_source") or "").casefold() == "subagent"
+            or source_is_subagent
+        )
+
     def ingest_hook(self, event: dict[str, Any], host: HostProcess | None = None) -> bool:
         event_name = str(event.get("hook_event_name", ""))
+        if event_name in SUBAGENT_LIFECYCLE_EVENTS:
+            return False
+        if (
+            event_name in {"UserPromptSubmit", "Stop"}
+            and (
+                self._has_subagent_identity(event)
+                or self._transcript_marks_subagent(event)
+            )
+        ):
+            # Some Codex surfaces normalize a child lifecycle message to a
+            # regular prompt/stop event while preserving the agent metadata.
+            return False
         if event_name not in {
             "SessionStart",
             "UserPromptSubmit",

@@ -35,6 +35,7 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 
 - 任务开始通知：项目、模型、时间和脱敏后的提示词摘要。
 - 任务完成通知：完整的 `last_assistant_message`，超过 QQ 限制时自动分段。
+- 子智能体静默：只通知主任务的一次总开始和总结果，不推送子智能体的启动、提示词或结束结果。
 - 权限提醒：默认关闭，显式开启后才通知人工确认请求；自动审查不会默认制造“等待人工审批”的噪音。
 - 多窗口支持：多个 Codex 窗口和多个项目共享一个 daemon 与消息队列，会话按 `session_id + 工作目录` 隔离。
 - 可靠投递：SQLite WAL、本地 outbox、速率限制、重试、分段和永久错误处理。
@@ -110,6 +111,7 @@ cd codexbot
 
 - 提交任务时只保存脱敏后的提示词预览，最多 120 个字符。
 - 停止事件会保存完整最终回复，并根据 QQ 消息限制自动分段发送。
+- 子智能体生命周期在入队前过滤；主任务仍各保留一次开始和最终通知，权限请求不会被该过滤器吞掉。
 - 权限通知默认关闭。如果确实需要人工确认提醒，请在启动 Codex 的终端中设置：
 
   ```powershell
@@ -184,6 +186,7 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 
 - Task-start notifications with the project, model, time, and a redacted prompt preview.
 - Complete final replies from `last_assistant_message`, automatically split for QQ limits.
+- Quiet subagents: only the root task's overall start and final result are sent; subagent starts, prompts, and finishes stay local.
 - Optional permission reminders, disabled by default to keep automatic-review noise out of QQ.
 - Multiple Codex windows and projects supported by one daemon and one local outbox, with sessions scoped by `session_id + working directory`.
 - SQLite WAL, retries, rate limiting, adaptive message splitting, and permanent-error handling.
@@ -240,6 +243,8 @@ Regenerate a pairing code with:
 | `/mute` | Pause future proactive notifications without backfilling old ones |
 | `/unmute` | Resume future proactive notifications |
 | `/help` | Show the command help |
+
+Subagent lifecycle events are filtered before they enter the outbox. The root task still gets one start and one final notification, while permission requests remain eligible for reminders.
 
 To opt into manual permission reminders, set this before launching Codex:
 
