@@ -1,0 +1,77 @@
+{
+  "description": "Queue Codex lifecycle events for the local CodexBot QQ companion.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
+            "commandWindows": "\"%LOCALAPPDATA%\\CodexBot\\runtime\\Scripts\\pythonw.exe\" -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}
