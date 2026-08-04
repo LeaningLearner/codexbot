@@ -13,6 +13,7 @@ import time
 import psutil
 
 from .botpy_safety import silence_botpy_logging
+from .codex_hooks import codex_home_dir, format_hook_trust, read_hook_trust
 from .installer import find_codex_command, install_personal_plugin, marketplace_contains_plugin
 from .paths import data_dir, database_path, ensure_data_dir, runtime_python
 from .processes import process_matches
@@ -140,6 +141,14 @@ def command_doctor(args: argparse.Namespace) -> int:
     installed, installed_detail = _codex_plugin_installed()
     checks.append(("Codex 插件状态", installed, installed_detail, True))
 
+    hook_entries = read_hook_trust(
+        codex_home_dir(),
+        home / "plugins" / "codexbot" / "hooks" / "hooks.json",
+        plugin_name="codexbot",
+    )
+    hook_ok, hook_detail = format_hook_trust(hook_entries)
+    checks.append(("Hook 信任", hook_ok, hook_detail, True))
+
     bound = store.get_bound_openid()
     checks.append(("QQ 单用户绑定", bool(bound), "已绑定" if bound else "尚未绑定", False))
     daemon = store.get_daemon_info()
@@ -156,7 +165,6 @@ def command_doctor(args: argparse.Namespace) -> int:
         print(f"[{marker}] {label}: {detail}")
         failed_required = failed_required or (required and not ok)
     print(f"[INFO] 数据目录: {root}")
-    print("[INFO] Hook 信任状态需在 Codex /hooks 中人工确认。")
     return 1 if failed_required else 0
 
 
