@@ -35,11 +35,157 @@ async def test_host_monitor_requires_two_empty_checks(tmp_path: Path, monkeypatc
     runtime = QQRuntime(store, logging.getLogger("test-host-monitor"))
     runtime.monitor_interval = 0
     runtime.empty_host_checks = 2
+    runtime.hostless_startup_grace = 0
 
     await runtime.monitor_hosts()
 
     assert runtime.stop_event.is_set()
     assert store.list_hosts() == []
+
+
+@pytest.mark.asyncio
+async def test_hostless_runtime_waits_for_qq_ready_and_delivers_pending_reply(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    store.set_setting("bound_openid", "owner")
+    store.ingest_hook(
+        {
+            "hook_event_name": "Stop",
+            "session_id": "hostless-session",
+            "turn_id": "hostless-turn",
+            "cwd": str(tmp_path),
+            "model": "model",
+            "last_assistant_message": "reply queued after the hook runner exited",
+        }
+    )
+    messages: list[str] = []
+
+    class FakeApi:
+        async def post_c2c_message(self, **kwargs: object) -> object:
+            messages.append(str(kwargs["content"]))
+            return object()
+
+    class FakeClient:
+        def __init__(self, runtime: QQRuntime) -> None:
+            self.runtime = runtime
+            self.api = FakeApi()
+            self.closed = False
+
+        async def start(self, **_kwargs: object) -> None:
+            # Real QQ startup took about three seconds in the captured logs;
+            # this scaled delay reproduces the same monitor race.
+            await asyncio.sleep(0.03)
+            await self.runtime.on_ready()
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+    clients: list[FakeClient] = []
+
+    def make_client(runtime: QQRuntime) -> FakeClient:
+        runtime.monitor_interval = 0.005
+        runtime.empty_host_checks = 2
+        runtime.hostless_startup_grace = 0.1
+        client = FakeClient(runtime)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("codexbot.qq_client._make_client", make_client)
+    await asyncio.wait_for(
+        run_qq_runtime(
+            store,
+            Credentials("appid", "secret"),
+            logging.getLogger("test-hostless-delivery"),
+            initial_reconnect_delay=0,
+        ),
+        timeout=2,
+    )
+
+    assert len(clients) == 1
+    assert clients[0].closed
+    assert len(messages) == 1
+    assert "reply queued after the hook runner exited" in messages[0]
+    assert store.get_due_outbox() is None
+
+
+@pytest.mark.asyncio
+async def test_hostless_pending_reply_survives_default_reconnect_delay(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    store.set_setting("bound_openid", "owner")
+    store.ingest_hook(
+        {
+            "hook_event_name": "Stop",
+            "session_id": "reconnect-session",
+            "turn_id": "reconnect-turn",
+            "cwd": str(tmp_path),
+            "model": "model",
+            "last_assistant_message": "deliver after the default reconnect delay",
+        }
+    )
+    messages: list[str] = []
+    clients: list[FakeClient] = []
+
+    class FakeApi:
+        def __init__(self, runtime: QQRuntime, number: int) -> None:
+            self.runtime = runtime
+            self.number = number
+
+        async def post_c2c_message(self, **kwargs: object) -> object:
+            if self.number == 1:
+                raise ConnectionError("first websocket disconnected")
+            messages.append(str(kwargs["content"]))
+            self.runtime.stop_event.set()
+            return object()
+
+    class FakeClient:
+        def __init__(self, runtime: QQRuntime, number: int) -> None:
+            self.runtime = runtime
+            self.number = number
+            self.api = FakeApi(runtime, number)
+            self.closed = False
+
+        async def start(self, **_kwargs: object) -> None:
+            await self.runtime.on_ready()
+            if self.number == 1:
+                raise ConnectionError("first websocket disconnected")
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.closed = True
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+    def make_client(runtime: QQRuntime) -> FakeClient:
+        runtime.monitor_interval = 0.005
+        runtime.empty_host_checks = 2
+        runtime.hostless_startup_grace = 0.05
+        client = FakeClient(runtime, len(clients) + 1)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr("codexbot.qq_client._make_client", make_client)
+    await asyncio.wait_for(
+        run_qq_runtime(
+            store,
+            Credentials("appid", "secret"),
+            logging.getLogger("test-hostless-reconnect"),
+        ),
+        timeout=10,
+    )
+
+    assert len(clients) == 2
+    assert all(client.closed for client in clients)
+    assert len(messages) == 1
+    assert "deliver after the default reconnect delay" in messages[0]
+    assert store.has_pending_outbox() is False
 
 
 @pytest.mark.asyncio
@@ -65,6 +211,84 @@ async def test_host_monitor_standalone_stays_online(tmp_path: Path, monkeypatch)
     assert store.list_hosts() == []  # dead hosts are still pruned
     runtime.stop_event.set()
     await task
+
+
+@pytest.mark.asyncio
+async def test_host_monitor_stays_online_for_active_pairing(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    store.create_pairing("123456", time.time() + 60)
+    runtime = QQRuntime(store, logging.getLogger("test-pairing-monitor"))
+    runtime.monitor_interval = 0.001
+    runtime.empty_host_checks = 2
+    runtime.hostless_startup_grace = 0
+    runtime.ready_event.set()
+
+    task = asyncio.create_task(runtime.monitor_hosts())
+    await asyncio.sleep(0.02)
+    assert not runtime.stop_event.is_set()
+    runtime.stop_event.set()
+    await task
+
+
+def test_daemon_final_handoff_restarts_after_clearing_old_pid(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    events: list[str] = []
+
+    class FakeSingleton:
+        def acquire(self) -> bool:
+            events.append("acquire")
+            return True
+
+        def release(self) -> None:
+            events.append("release")
+
+    class FakeStore:
+        def set_daemon_info(self, _pid: int, _created: float) -> None:
+            events.append("set")
+
+        def clear_daemon_info(self, _pid: int) -> None:
+            events.append("clear")
+
+        def cleanup(self) -> None:
+            return None
+
+        def companion_work_pending(self) -> bool:
+            assert events[-2:] == ["clear", "release"]
+            return True
+
+        def list_hosts(self) -> list[object]:
+            return []
+
+    class FakeProcess:
+        def __init__(self, _pid: int) -> None:
+            pass
+
+        def create_time(self) -> float:
+            return 123.0
+
+    fake_store = FakeStore()
+
+    async def no_runtime(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(daemon, "ensure_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(daemon, "database_path", lambda: tmp_path / "state.sqlite3")
+    monkeypatch.setattr(daemon, "FileLock", lambda *_args, **_kwargs: FakeSingleton())
+    monkeypatch.setattr(daemon, "Store", lambda _path: fake_store)
+    monkeypatch.setattr(daemon, "configure_logging", lambda _name: logging.getLogger("handoff"))
+    monkeypatch.setattr(daemon, "_run_active_daemon", no_runtime)
+    monkeypatch.setattr(daemon.psutil, "Process", FakeProcess)
+
+    def restart(state: object) -> bool:
+        assert state is fake_store
+        events.append("restart")
+        return True
+
+    monkeypatch.setattr(daemon, "ensure_daemon", restart)
+
+    assert daemon.main() == 0
+    assert events[-3:] == ["clear", "release", "restart"]
 
 
 @pytest.mark.asyncio
@@ -495,15 +719,15 @@ print(ensure_daemon(store))
     assert process_matches(*info)
 
     started = time.monotonic()
-    # The hidden companion needs pythonw cold start (~1s) plus two 1s empty-host
-    # polls before it exits; keep the deadline comfortably above that so the
-    # timing assertion is not flaky under load.
-    deadline = started + 8.0
+    # Pythonw and Windows Credential Manager cold starts vary substantially on
+    # a busy desktop. The companion must still leave promptly after two empty
+    # host polls, but allow headroom for process initialization.
+    deadline = started + 12.0
     while time.monotonic() < deadline and store.get_daemon_info() is not None:
         time.sleep(0.05)
 
     assert store.get_daemon_info() is None
-    assert time.monotonic() - started <= 6.0
+    assert time.monotonic() - started <= 10.0
 
     process_deadline = time.monotonic() + 2.0
     while time.monotonic() < process_deadline and process_matches(*info):

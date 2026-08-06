@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from pathlib import Path
 
 import pytest
 
 from codexbot.codex_login import AccountInfo
+from codexbot.codex_accounts import CodexAccountManager
 from codexbot.commands import CommandService
 from codexbot.codex_usage import parse_rate_limits
 from codexbot.store import Store
@@ -43,6 +46,56 @@ class FakeCodexClient:
                 }
             }
         }
+
+
+def _switcher_id_token(email: str, account_id: str) -> str:
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "email": email,
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id,
+                    "chatgpt_plan_type": "plus",
+                },
+            }
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.signature"
+
+
+def _switcher_account(account_id: str, email: str) -> dict[str, object]:
+    return {
+        "id": account_id,
+        "name": email,
+        "email": email,
+        "plan_type": "plus",
+        "auth_mode": "chat_g_p_t",
+        "auth_data": {
+            "type": "chat_g_p_t",
+            "id_token": _switcher_id_token(email, account_id),
+            "access_token": f"access-{account_id}",
+            "refresh_token": f"refresh-{account_id}",
+            "account_id": account_id,
+        },
+        "auth_state": "ready",
+    }
+
+
+def _write_switcher_store(path: Path) -> None:
+    path.mkdir(parents=True)
+    (path / "accounts.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "accounts": [
+                    _switcher_account("account-one", "one@example.com"),
+                    _switcher_account("account-two", "two@example.com"),
+                ],
+                "active_account_id": "account-one",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_usage_parser_keeps_primary_and_secondary_for_multiple_limit_ids() -> None:
@@ -250,14 +303,24 @@ async def test_account_command_list_use_delete(monkeypatch, tmp_path: Path) -> N
 
     monkeypatch.setattr(account_switch, "accounts_dir", _accounts_dir)
     monkeypatch.setattr(account_switch, "auth_file_path", lambda: tmp_path / ".codex" / "auth.json")
+    monkeypatch.setattr(account_switch, "_running_codex_processes", lambda: ())
 
     # list with no accounts
-    service = CommandService(store, codex_client=FakeCodexClient())
+    account_manager = CodexAccountManager(
+        switcher_home=tmp_path / ".codex-switcher",
+        codex_home=tmp_path / ".codex",
+        process_checker=lambda: (),
+    )
+    service = CommandService(
+        store,
+        codex_client=FakeCodexClient(),
+        account_manager=account_manager,
+    )
     assert await service.handle(
         openid="owner", message_id="m1", content="/account list",
         passive_send=sent.passive_send, active_send=sent.active_send,
     ) == "replied"
-    assert "还没有保存任何账号" in sent.passive[-1][1]
+    assert "还没有可切换的账号" in sent.passive[-1][1]
 
     # /account with no args shows the current account
     assert await service.handle(
@@ -272,3 +335,53 @@ async def test_account_command_list_use_delete(monkeypatch, tmp_path: Path) -> N
         passive_send=sent.passive_send, active_send=sent.active_send,
     ) == "replied"
     assert "/account save 名称" in sent.passive[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_account_command_lists_and_switches_codex_login_accounts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    store = Store(tmp_path / "state.sqlite3")
+    sent = SendRecorder()
+    store.create_pairing("ABCD-EF23", expires_at=10_000_000_000.0)
+    assert store.consume_pairing("ABCD-EF23", "owner", now=1.0)
+
+    switcher_home = tmp_path / ".codex-switcher"
+    codex_home = tmp_path / ".codex"
+    _write_switcher_store(switcher_home)
+    monkeypatch.setattr(account_switch, "accounts_dir", lambda: tmp_path / "snapshots")
+    manager = CodexAccountManager(
+        switcher_home=switcher_home,
+        codex_home=codex_home,
+        process_checker=lambda: (),
+    )
+    service = CommandService(
+        store,
+        codex_client=FakeCodexClient(),
+        account_manager=manager,
+    )
+
+    assert await service.handle(
+        openid="owner",
+        message_id="account-list",
+        content="/account list",
+        passive_send=sent.passive_send,
+        active_send=sent.active_send,
+    ) == "replied"
+    assert "1. one@example.com" in sent.passive[-1][1]
+    assert "2. two@example.com" in sent.passive[-1][1]
+
+    assert await service.handle(
+        openid="owner",
+        message_id="account-use",
+        content="/account use 2",
+        passive_send=sent.passive_send,
+        active_send=sent.active_send,
+    ) == "replied"
+    assert "已切换到 codex_login 账号" in sent.passive[-1][1]
+
+    auth = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    saved = json.loads((switcher_home / "accounts.json").read_text(encoding="utf-8"))
+    assert auth["tokens"]["account_id"] == "account-two"
+    assert saved["active_account_id"] == "account-two"
+    assert saved["accounts"][1]["last_used_at"]

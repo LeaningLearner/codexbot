@@ -13,6 +13,7 @@ from typing import Any
 
 from .installer import find_codex_command
 from .security import redact_secrets
+from .subprocess_utils import hidden_console_subprocess_kwargs
 
 
 APP_SERVER_DASHBOARD_URL = "https://chatgpt.com/codex/settings/usage"
@@ -218,11 +219,7 @@ class CodexAppServerClient:
             "bufsize": 1,
             "shell": False,
         }
-        if os.name == "nt":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
+        kwargs.update(hidden_console_subprocess_kwargs(new_process_group=True))
         try:
             process = self._popen_factory(self._command(), **kwargs)
         except (OSError, ValueError) as exc:

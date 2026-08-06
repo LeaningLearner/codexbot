@@ -3,25 +3,33 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 from typing import Any
 
+from .paths import runtime_python
+from .subprocess_utils import (
+    hidden_console_subprocess_kwargs,
+    npm_codex_native_executable,
+)
+
 
 PLUGIN_NAME = "codexbot"
 CODEX_PLUGIN_LIST_TIMEOUT_SECONDS = 15
 CODEX_PLUGIN_ADD_TIMEOUT_SECONDS = 60
 CODEX_PLUGIN_REMOVE_TIMEOUT_SECONDS = 15
-REQUIRED_HOOK_EVENTS = {
+CORE_HOOK_EVENTS = {
     "SessionStart",
     "UserPromptSubmit",
-    "PermissionRequest",
-    "PostToolUse",
     "Stop",
     "SessionEnd",
 }
+PERMISSION_HOOK_EVENTS = {"PermissionRequest", "PostToolUse"}
+ALL_HOOK_EVENTS = CORE_HOOK_EVENTS | PERMISSION_HOOK_EVENTS
+PERMISSION_NOTIFICATION_ENV = "CODEXBOT_NOTIFY_PERMISSION_REQUESTS"
 
 
 @dataclass(frozen=True)
@@ -124,9 +132,12 @@ def validate_plugin_tree(plugin_path: Path) -> None:
 
     hooks_document = _load_json(hooks_path)
     hooks = hooks_document.get("hooks")
-    if not isinstance(hooks, dict) or set(hooks) != REQUIRED_HOOK_EVENTS:
-        raise RuntimeError("hooks.json 必须且只能注册六个 CodexBot 生命周期事件")
-    for event_name in REQUIRED_HOOK_EVENTS:
+    if not isinstance(hooks, dict) or frozenset(hooks) not in {
+        frozenset(CORE_HOOK_EVENTS),
+        frozenset(ALL_HOOK_EVENTS),
+    }:
+        raise RuntimeError("hooks.json 的 CodexBot 生命周期事件集合无效")
+    for event_name in hooks:
         groups = hooks.get(event_name)
         if not isinstance(groups, list) or not groups:
             raise RuntimeError(f"Hook 未配置：{event_name}")
@@ -136,15 +147,70 @@ def validate_plugin_tree(plugin_path: Path) -> None:
         handler = handlers[0]
         if not isinstance(handler, dict) or handler.get("type") != "command":
             raise RuntimeError(f"Hook 处理器类型无效：{event_name}")
-        windows_command = str(handler.get("commandWindows") or "")
-        if "${PLUGIN_ROOT}" not in windows_command:
-            raise RuntimeError(f"Windows Hook 必须通过 PLUGIN_ROOT 启动：{event_name}")
+        command = str(handler.get("command") or "").strip()
+        windows_command = str(handler.get("commandWindows") or "").strip()
+        if not command:
+            raise RuntimeError(f"Hook command 不能为空：{event_name}")
+        if "entry.py" not in windows_command.casefold():
+            raise RuntimeError(f"Windows Hook 必须调用 stdlib entry.py：{event_name}")
+        folded = windows_command.casefold()
+        if not folded.startswith("py.exe -3.11 -e "):
+            raise RuntimeError(f"Windows Hook 必须使用 shell-neutral 的 py.exe 入口：{event_name}")
+        if any(wrapper in folded for wrapper in ("cmd.exe", "powershell")):
+            raise RuntimeError(f"Windows Hook 不得依赖特定 shell wrapper：{event_name}")
         try:
             timeout = float(handler.get("timeout"))
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Hook timeout 无效：{event_name}") from exc
         if timeout <= 0 or timeout > 2:
             raise RuntimeError(f"Hook timeout 必须在 0-2 秒内：{event_name}")
+
+
+def _materialize_hook_commands(
+    plugin_path: Path,
+    *,
+    final_plugin_path: Path,
+    runtime_executable: Path,
+    permission_notifications: bool,
+) -> None:
+    """Write stable, windowless commands for the final installed paths."""
+
+    hooks_path = plugin_path / "hooks" / "hooks.json"
+    document = _load_json(hooks_path)
+    hooks = document.get("hooks")
+    if not isinstance(hooks, dict):
+        raise RuntimeError("hooks.json 缺少 hooks 对象")
+
+    if not permission_notifications:
+        for event_name in PERMISSION_HOOK_EVENTS:
+            hooks.pop(event_name, None)
+
+    console_runtime = Path(runtime_executable)
+    if console_runtime.name.casefold() == "pythonw.exe":
+        console_runtime = console_runtime.with_name("python.exe")
+    entry_path = final_plugin_path / "hooks" / "entry.py"
+    # Codex executes hook strings through the user's configured shell. A
+    # quoted executable path is valid in cmd.exe but needs PowerShell's `&`
+    # operator. The Windows Python launcher is a bare first token; plugin and
+    # runtime paths are regular quoted arguments, which both shells parse.
+    command = f'py.exe -3.11 -E "{entry_path}" --runtime "{console_runtime}"'
+
+    for event_name, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise RuntimeError(f"Hook 配置无效：{event_name}")
+        for group in groups:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                raise RuntimeError(f"Hook 没有命令处理器：{event_name}")
+            for handler in handlers:
+                if not isinstance(handler, dict) or handler.get("type") != "command":
+                    raise RuntimeError(f"Hook 处理器类型无效：{event_name}")
+                # Keep both fields identical so older Windows app builds that
+                # ignore commandWindows still use the same shell-neutral path.
+                handler["command"] = command
+                handler["commandWindows"] = command
+
+    _write_json_atomic(hooks_path, document, backup=False)
 
 
 def _cachebust_manifest(plugin_path: Path) -> str:
@@ -252,7 +318,18 @@ def _merge_personal_marketplace(path: Path) -> str:
 
 
 def find_codex_command() -> str | None:
-    return shutil.which("codex.cmd") or shutil.which("codex")
+    if os.name == "nt":
+        shim = shutil.which("codex.cmd") or shutil.which("codex")
+        if shim and "\\windowsapps\\" in shim.casefold().replace("/", "\\"):
+            shim = None
+        native = npm_codex_native_executable(shim)
+        if native:
+            return native
+        executable = shutil.which("codex.exe")
+        if executable and "\\windowsapps\\" not in executable.casefold().replace("/", "\\"):
+            return executable
+        return shim
+    return shutil.which("codex")
 
 
 def _run_codex_json(
@@ -269,6 +346,7 @@ def _run_codex_json(
         capture_output=True,
         timeout=timeout,
         check=False,
+        **hidden_console_subprocess_kwargs(),
     )
 
 
@@ -503,6 +581,8 @@ def install_personal_plugin(
     *,
     home: Path | None = None,
     run_codex: bool = True,
+    runtime_executable: Path | None = None,
+    permission_notifications: bool | None = None,
 ) -> InstallResult:
     repo_root = Path(repo_root).resolve()
     source = repo_root / "plugin" / PLUGIN_NAME
@@ -510,6 +590,13 @@ def install_personal_plugin(
 
     home = Path.home() if home is None else Path(home).resolve()
     plugin_path = home / "plugins" / PLUGIN_NAME
+    runtime_executable = (
+        runtime_python()
+        if runtime_executable is None
+        else Path(runtime_executable).resolve()
+    )
+    if permission_notifications is None:
+        permission_notifications = os.environ.get(PERMISSION_NOTIFICATION_ENV) == "1"
     if plugin_path.exists():
         existing_manifest = plugin_path / ".codex-plugin" / "plugin.json"
         if not existing_manifest.is_file() or _load_json(existing_manifest).get("name") != PLUGIN_NAME:
@@ -538,6 +625,12 @@ def install_personal_plugin(
     try:
         # Build from an empty directory so source deletions remove target stale files.
         _copy_plugin_tree(source, staged_plugin)
+        _materialize_hook_commands(
+            staged_plugin,
+            final_plugin_path=plugin_path,
+            runtime_executable=runtime_executable,
+            permission_notifications=permission_notifications,
+        )
         _cachebust_manifest(staged_plugin)
         validate_plugin_tree(staged_plugin)
 

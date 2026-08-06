@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 
 import pytest
 
-from codexbot.installer import install_personal_plugin, validate_plugin_tree
+from codexbot.installer import (
+    ALL_HOOK_EVENTS,
+    CORE_HOOK_EVENTS,
+    install_personal_plugin,
+    validate_plugin_tree,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +23,8 @@ def test_source_plugin_passes_installer_validation() -> None:
 
 
 def test_installer_merges_marketplace_preserves_order_and_updates(tmp_path: Path) -> None:
-    home = tmp_path / "home"
+    home = tmp_path / "home with 空格"
+    runtime = home / "本地 数据" / "runtime" / "Scripts" / "python.exe"
     marketplace_path = home / ".agents" / "plugins" / "marketplace.json"
     marketplace_path.parent.mkdir(parents=True)
     original = {
@@ -34,7 +41,13 @@ def test_installer_merges_marketplace_preserves_order_and_updates(tmp_path: Path
     }
     marketplace_path.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
 
-    result = install_personal_plugin(ROOT, home=home, run_codex=False)
+    result = install_personal_plugin(
+        ROOT,
+        home=home,
+        run_codex=False,
+        runtime_executable=runtime,
+        permission_notifications=False,
+    )
 
     assert result.marketplace_name == "my-personal"
     marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
@@ -51,7 +64,29 @@ def test_installer_merges_marketplace_preserves_order_and_updates(tmp_path: Path
     assert manifest["version"].startswith("0.1.0+codex.local-")
     assert [path.name for path in manifest_dir.iterdir()] == ["plugin.json"]
 
-    second = install_personal_plugin(ROOT, home=home, run_codex=False)
+    installed_hooks = json.loads(
+        (result.plugin_path / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]
+    expected_command = (
+        f'py.exe -3.11 -E "{result.plugin_path / "hooks" / "entry.py"}" '
+        f'--runtime "{runtime}"'
+    )
+    assert set(installed_hooks) == CORE_HOOK_EVENTS
+    for groups in installed_hooks.values():
+        handler = groups[0]["hooks"][0]
+        assert handler["command"] == expected_command
+        assert handler["commandWindows"] == expected_command
+        assert "${PLUGIN_ROOT}" not in expected_command
+        assert "%LOCALAPPDATA%" not in expected_command
+        assert "powershell" not in expected_command.casefold()
+
+    second = install_personal_plugin(
+        ROOT,
+        home=home,
+        run_codex=False,
+        runtime_executable=runtime,
+        permission_notifications=False,
+    )
     assert second.plugin_path == result.plugin_path
     second_manifest = json.loads(
         (second.plugin_path / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
@@ -59,6 +94,62 @@ def test_installer_merges_marketplace_preserves_order_and_updates(tmp_path: Path
     assert second_manifest["version"] != manifest["version"]
     updated = json.loads(marketplace_path.read_text(encoding="utf-8"))
     assert [entry["name"] for entry in updated["plugins"]].count("codexbot") == 1
+
+
+def test_installer_can_opt_in_to_permission_hooks(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    result = install_personal_plugin(
+        ROOT,
+        home=home,
+        run_codex=False,
+        runtime_executable=home / "runtime" / "Scripts" / "python.exe",
+        permission_notifications=True,
+    )
+
+    installed_hooks = json.loads(
+        (result.plugin_path / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]
+    assert set(installed_hooks) == ALL_HOOK_EVENTS
+
+
+@pytest.mark.skipif(os.name != "nt", reason="CodexBot hook commands target Windows shells")
+def test_materialized_hook_command_runs_from_cmd_and_powershell(tmp_path: Path) -> None:
+    home = tmp_path / "shell test 空格"
+    runtime = home / "runtime path" / "Scripts" / "python.exe"
+    result = install_personal_plugin(
+        ROOT,
+        home=home,
+        run_codex=False,
+        runtime_executable=runtime,
+        permission_notifications=False,
+    )
+    hooks = json.loads(
+        (result.plugin_path / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]
+    command = hooks["SessionStart"][0]["hooks"][0]["commandWindows"]
+
+    invocations = (
+        # Codex uses Command::raw_arg for cmd.exe /C and wraps the complete
+        # hook string in one raw quote pair on Windows.
+        f'cmd.exe /D /S /C "{command}"',
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+    )
+    environment = os.environ.copy()
+    environment["CODEXBOT_DATA_DIR"] = str(tmp_path / "hook data")
+    for invocation in invocations:
+        completed = subprocess.run(
+            invocation,
+            input="",
+            capture_output=True,
+            text=True,
+            encoding="mbcs",
+            errors="replace",
+            env=environment,
+            timeout=5,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "{}"
 
 
 def test_installer_repairs_missing_marketplace_interface(tmp_path: Path) -> None:

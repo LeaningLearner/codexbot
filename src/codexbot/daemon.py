@@ -9,12 +9,19 @@ import psutil
 from .locks import FileLock
 from .logging_utils import configure_logging
 from .paths import database_path, ensure_data_dir
+from .processes import ensure_daemon, process_matches
 from .qq_client import run_qq_runtime
 from .security import Credentials, load_credentials, redact_secrets
 from .store import Store
 
 
 CLEANUP_INTERVAL_SECONDS = 60.0 * 60.0
+
+
+def _lifecycle_work_remains(store: Store) -> bool:
+    if store.companion_work_pending():
+        return True
+    return any(process_matches(host.pid, host.create_time) for host in store.list_hosts())
 
 
 async def _periodic_cleanup(
@@ -119,6 +126,7 @@ def main() -> int:
     standalone = os.environ.get("CODEXBOT_STANDALONE") == "1"
     if standalone:
         logger.info("Running as a standalone companion (CODEXBOT_STANDALONE=1)")
+    exit_code = 0
     try:
         try:
             created = psutil.Process(os.getpid()).create_time()
@@ -130,11 +138,17 @@ def main() -> int:
     except Exception as exc:
         detail = redact_secrets(str(exc))[:300]
         logger.error("Companion stopped unexpectedly: %s: %s", type(exc).__name__, detail)
-        return 1
+        exit_code = 1
     finally:
+        # Clear the old PID before the final work check. A hook arriving before
+        # this point is observed below; one arriving afterwards sees no live
+        # daemon record and can start its own successor. Release the singleton
+        # before spawning so the successor cannot lose the handoff race.
         store.clear_daemon_info(os.getpid())
         singleton.release()
-    return 0
+        if _lifecycle_work_remains(store):
+            ensure_daemon(store)
+    return exit_code
 
 
 if __name__ == "__main__":

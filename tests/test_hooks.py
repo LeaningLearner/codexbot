@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+
+import codexbot.hooks as runtime_hooks
+from codexbot.store import Store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,12 +29,20 @@ def test_bootstrap_removes_foreign_python_environment(monkeypatch) -> None:  # t
     monkeypatch.setenv("PYTHONHOME", r"C:\Program Files\LibreOffice\python-core")
     monkeypatch.setenv("PYTHONPATH", r"C:\Program Files\LibreOffice\program")
     monkeypatch.setenv("PYTHONUTF8", "1")
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.null.Keyring")
     monkeypatch.setenv("CODEXBOT_SENTINEL", "preserved")
 
-    environment = _load_bootstrap()._runtime_environment()
+    module = _load_bootstrap()
+    monkeypatch.setattr(module, "_ancestor_process_ids", lambda: (101, 202))
+    environment = module._runtime_environment()
 
-    assert not any(name.upper().startswith("PYTHON") for name in environment)
+    assert not any(
+        name.upper().startswith("PYTHON") and name.upper() != "PYTHON_KEYRING_BACKEND"
+        for name in environment
+    )
+    assert environment["PYTHON_KEYRING_BACKEND"] == "keyring.backends.null.Keyring"
     assert environment["CODEXBOT_SENTINEL"] == "preserved"
+    assert environment[module.ANCESTOR_PIDS_ENV] == "101,202"
 
 
 def test_bootstrap_is_neutral_when_runtime_is_missing_and_never_logs_payload(tmp_path: Path) -> None:
@@ -129,6 +141,7 @@ def test_bootstrap_handoffs_payload_without_waiting_and_stays_neutral(
         buffer = io.BytesIO(payload)
 
     monkeypatch.setattr(module, "_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(module, "_ancestor_process_ids", lambda: (303, 404))
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(module.sys, "stdin", FakeInput())
 
@@ -140,8 +153,127 @@ def test_bootstrap_handoffs_payload_without_waiting_and_stays_neutral(
     assert isinstance(kwargs, dict)
     assert kwargs["stdin"] == module.subprocess.PIPE
     assert "timeout" not in kwargs
+    assert kwargs["env"][module.ANCESTOR_PIDS_ENV] == "303,404"
+    if os.name == "nt":
+        assert kwargs["creationflags"] & module.subprocess.CREATE_NO_WINDOW
+        assert kwargs["startupinfo"].wShowWindow == module.subprocess.SW_HIDE
     assert bytes(process.stdin.data) == payload
     assert process.stdin.closed
+
+
+def test_runtime_hook_uses_bootstrap_ancestor_snapshot(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    captured: dict[str, object] = {}
+
+    def discover(*, ancestor_pids: tuple[int, ...]):
+        captured["ancestor_pids"] = ancestor_pids
+        return None
+
+    monkeypatch.setenv(runtime_hooks.ANCESTOR_PIDS_ENV, "303,bad,404,303")
+    monkeypatch.setattr(runtime_hooks, "discover_codex_host", discover)
+    monkeypatch.setattr(runtime_hooks, "ensure_daemon", lambda _store: False)
+
+    runtime_hooks.process_hook(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "ancestor-session",
+            "cwd": str(tmp_path),
+            "model": "model",
+        },
+        store,
+    )
+
+    assert captured["ancestor_pids"] == (303, 404)
+    assert runtime_hooks.ANCESTOR_PIDS_ENV not in os.environ
+
+
+def test_hostless_post_tool_use_does_not_start_daemon(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    store.set_setting("bound_openid", "owner")
+    launches: list[object] = []
+    monkeypatch.delenv("CODEXBOT_DISABLE_DAEMON", raising=False)
+    monkeypatch.setattr(runtime_hooks, "discover_codex_host", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime_hooks, "ensure_daemon", lambda state: launches.append(state))
+
+    inserted = runtime_hooks.process_hook(
+        {
+            "hook_event_name": "PostToolUse",
+            "session_id": "quiet-session",
+            "turn_id": "quiet-turn",
+            "cwd": str(tmp_path),
+            "model": "model",
+            "tool_name": "Read",
+        },
+        store,
+        ancestor_pids=(),
+    )
+
+    assert inserted is False
+    assert launches == []
+
+    inserted = runtime_hooks.process_hook(
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "quiet-session",
+            "turn_id": "message-turn",
+            "cwd": str(tmp_path),
+            "model": "model",
+            "prompt": "send this task notification",
+        },
+        store,
+        ancestor_pids=(),
+    )
+    assert inserted is True
+    assert launches == [store]
+
+
+def test_existing_pending_work_and_pairing_can_start_hostless_daemon(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = Store(tmp_path / "state.sqlite3")
+    store.set_setting("bound_openid", "owner")
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "pending-session",
+        "turn_id": "pending-turn",
+        "cwd": str(tmp_path),
+        "model": "model",
+        "last_assistant_message": "queued once",
+    }
+    assert store.ingest_hook(payload) is True
+    launches: list[object] = []
+    monkeypatch.delenv("CODEXBOT_DISABLE_DAEMON", raising=False)
+    monkeypatch.setattr(runtime_hooks, "discover_codex_host", lambda **_kwargs: None)
+    monkeypatch.setattr(runtime_hooks, "ensure_daemon", lambda state: launches.append(state))
+
+    # The duplicate is not inserted, but the already-pending reliable message
+    # must still wake a daemon. SessionEnd must not suppress that recovery.
+    assert runtime_hooks.process_hook(payload, store, ancestor_pids=()) is False
+    runtime_hooks.process_hook(
+        {
+            "hook_event_name": "SessionEnd",
+            "session_id": "pending-session",
+            "cwd": str(tmp_path),
+            "model": "model",
+        },
+        store,
+        ancestor_pids=(),
+    )
+    assert launches == [store, store]
+
+    pairing_store = Store(tmp_path / "pairing.sqlite3")
+    pairing_store.create_pairing("123456", time.time() + 60)
+    runtime_hooks.process_hook(
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "pairing-session",
+            "cwd": str(tmp_path),
+            "model": "model",
+        },
+        pairing_store,
+        ancestor_pids=(),
+    )
+    assert launches[-1] is pairing_store
 
 
 def test_runtime_hook_writes_queue_and_returns_empty_json(tmp_path: Path) -> None:

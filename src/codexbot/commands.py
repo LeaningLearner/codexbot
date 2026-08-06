@@ -6,6 +6,7 @@ import inspect
 import re
 from typing import Any, Awaitable, Callable
 
+from .codex_accounts import CodexAccountError, CodexAccountManager
 from .codex_login import (
     AccountInfo,
     AppServerError,
@@ -33,8 +34,8 @@ HELP_TEXT = (
     "/usage - 查看 Codex 各限额剩余百分比和重置时间\n"
     "/account - 查看当前 Codex 账号\n"
     "/account save 名称 - 保存当前 Codex 账号\n"
-    "/account list - 列出已保存的账号\n"
-    "/account use 名称 - 切换到指定账号（切换后重启 Codex 生效）\n"
+    "/account list - 列出 codex_login 账号和加密快照\n"
+    "/account use 序号/名称/邮箱/ID - 安全切换账号\n"
     "/account delete 名称 - 删除已保存的账号\n"
     "/mute - 暂停主动通知\n"
     "/unmute - 恢复主动通知\n"
@@ -141,7 +142,12 @@ def _last_text(store: Store, page: int, project: str | None = None) -> str:
     )
 
 
-async def _invoke_codex(method: Callable[..., Any], *args: Any, timeout: float = 30.0, **kwargs: Any) -> Any:
+async def _invoke_codex(
+    method: Callable[..., Any],
+    *args: Any,
+    timeout: float = 30.0,
+    **kwargs: Any,
+) -> Any:
     """Run sync app-server clients away from the QQ event loop and accept test fakes."""
 
     if inspect.iscoroutinefunction(method):
@@ -152,16 +158,36 @@ async def _invoke_codex(method: Callable[..., Any], *args: Any, timeout: float =
     return result
 
 
+async def _invoke_account_mutation(
+    method: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run a credential mutation without reporting a misleading timeout.
+
+    Cancelling ``asyncio.to_thread`` only stops waiting for the worker; it
+    cannot stop a filesystem write already in progress.  Account mutations
+    therefore run off the event loop but are awaited to their real outcome.
+    """
+
+    if inspect.iscoroutinefunction(method):
+        return await method(*args, **kwargs)
+    result = await asyncio.to_thread(method, *args, **kwargs)
+    return await result if inspect.isawaitable(result) else result
+
+
 class CommandService:
     def __init__(
         self,
         store: Store,
         *,
         codex_client: Any | None = None,
+        account_manager: Any | None = None,
         codex_timeout: float = 30.0,
     ) -> None:
         self.store = store
         self.codex_client = codex_client or CodexAppServerClient()
+        self.account_manager = account_manager or CodexAccountManager()
         self.codex_timeout = max(float(codex_timeout), 0.1)
 
     async def _usage_text(self) -> str:
@@ -251,7 +277,11 @@ class CommandService:
         elif lower == "/account":
             response = await self._account_text()
         elif lower.startswith("/account "):
-            response = _account_switch_text(command[len("/account"):])
+            response = await _account_switch_text(
+                command[len("/account"):],
+                account_manager=self.account_manager,
+                timeout=self.codex_timeout,
+            )
         elif lower == "/last" or lower.startswith("/last "):
             parsed = _last_arguments(command[5:])
             if parsed is None:
@@ -273,60 +303,162 @@ class CommandService:
         return "replied"
 
 
-def _account_switch_text(argument: str) -> str:
+def _account_switch_error(prefix: str, exc: BaseException) -> str:
+    detail = _safe_field(exc, fallback="请稍后重试", limit=220)
+    response = f"{prefix}失败：{detail}"
+    if "正在运行" in detail:
+        response += (
+            "\n请先运行 .\\codexbot.cmd start 保持机器人在线，"
+            "再完全退出 Codex/ChatGPT 后重试。"
+        )
+    return response
+
+
+async def _account_sources_text(account_manager: Any, *, timeout: float) -> str:
+    try:
+        store = await _invoke_codex(account_manager.load_store, timeout=timeout)
+    except Exception as exc:
+        return _account_switch_error("读取 codex_login 账号", exc)
+    try:
+        snapshots = await _invoke_codex(account_switch.list_accounts, timeout=timeout)
+    except Exception as exc:
+        return _account_switch_error("读取 CodexBot 加密快照", exc)
+
+    lines: list[str] = []
+    accounts = tuple(getattr(store, "accounts", ()) or ())
+    active_id = getattr(store, "active_account_id", None)
+    if accounts:
+        lines.append("codex_login 已保存账号：")
+        for index, account in enumerate(accounts, 1):
+            markers: list[str] = []
+            if account.id == active_id:
+                markers.append("当前")
+            if not account.is_ready:
+                markers.append("登录过期")
+            suffix = f"（{'、'.join(markers)}）" if markers else ""
+            email = _safe_field(account.email, fallback="无邮箱")
+            lines.append(f"{index}. {_safe_field(account.name)} · {email}{suffix}")
+
+    if snapshots:
+        if lines:
+            lines.append("")
+        lines.append("CodexBot 加密快照：")
+        for snapshot in snapshots:
+            email = _safe_field(snapshot.email, fallback="未识别邮箱")
+            lines.append(f"• {_safe_field(snapshot.name)}（{email}）")
+
+    if not lines:
+        return (
+            "还没有可切换的账号。\n"
+            "可先在 codex_login 中添加账号，或用 /account save 名称保存当前登录。"
+        )
+    lines.append("")
+    lines.append("切换：/account use 序号、名称、邮箱或账号 ID")
+    return "\n".join(lines)
+
+
+async def _account_switch_text(
+    argument: str,
+    *,
+    account_manager: Any,
+    timeout: float,
+) -> str:
     """Handle /account save|list|use|delete for QQ."""
 
     tokens = argument.strip().split()
     action = tokens[0].casefold() if tokens else ""
     if action == "list":
-        accounts = account_switch.list_accounts()
-        if not accounts:
-            return "还没有保存任何账号。\n用 /account save 名称 保存当前账号。"
-        lines = ["已保存的 Codex 账号："]
-        for account in accounts:
-            email = _safe_field(account.email, fallback="未识别邮箱")
-            lines.append(f"• {account.name}（{email}）")
-        return "\n".join(lines)
+        return await _account_sources_text(account_manager, timeout=timeout)
     if action == "save":
         if len(tokens) < 2:
             return "用法：/account save 名称"
         name = " ".join(tokens[1:])
         try:
-            snapshot = account_switch.save_current_account(name)
+            snapshot = await _invoke_account_mutation(
+                account_switch.save_current_account,
+                name,
+            )
         except account_switch.AccountSwitchError as exc:
-            return f"保存失败：{_safe_field(exc)}"
+            return _account_switch_error("保存", exc)
+        except Exception as exc:
+            return _account_switch_error("保存", exc)
         email = _safe_field(snapshot.email, fallback="未识别邮箱")
-        return f"已保存当前账号为 {snapshot.name}（{email}）。\n用 /account use {snapshot.name} 可随时切换。"
+        display_name = _safe_field(snapshot.name)
+        return f"已保存当前账号为 {display_name}（{email}）。\n用 /account use {display_name} 可随时切换。"
     if action == "use":
         if len(tokens) < 2:
-            return "用法：/account use 名称"
-        name = " ".join(tokens[1:])
+            return "用法：/account use 序号、名称、邮箱或账号 ID"
+        selector = " ".join(tokens[1:])
+
+        # Prefer the codex_login store. Resolve before switching so a local
+        # DPAPI snapshot with the same display name cannot silently shadow it.
+        external_error: CodexAccountError | None = None
         try:
-            email, _ = account_switch.switch_account(name)
-        except account_switch.AccountSwitchError as exc:
-            return f"切换失败：{_safe_field(exc)}"
-        current = _safe_field(account_switch.current_account_email(), fallback="未知邮箱")
+            store = await _invoke_codex(account_manager.load_store, timeout=timeout)
+        except Exception as exc:
+            return _account_switch_error("读取 codex_login 账号", exc)
+        if tuple(getattr(store, "accounts", ()) or ()):
+            try:
+                await _invoke_codex(account_manager.resolve_account, selector, timeout=timeout)
+            except CodexAccountError as exc:
+                external_error = exc
+            except Exception as exc:
+                return _account_switch_error("解析 codex_login 账号", exc)
+            else:
+                try:
+                    account = await _invoke_account_mutation(
+                        account_manager.switch_account,
+                        selector,
+                    )
+                except Exception as exc:
+                    return _account_switch_error("切换 codex_login 账号", exc)
+                email = _safe_field(account.email, fallback="无邮箱")
+                display_name = _safe_field(account.name)
+                return (
+                    f"已切换到 codex_login 账号 {display_name}（{email}）。\n"
+                    "已更新 Codex 登录并同步当前账号；现在可以重新启动 Codex。"
+                )
+
+        try:
+            snapshots = await _invoke_codex(account_switch.list_accounts, timeout=timeout)
+        except Exception as exc:
+            return _account_switch_error("读取 CodexBot 加密快照", exc)
+        local = next(
+            (item for item in snapshots if item.name.casefold() == selector.casefold()),
+            None,
+        )
+        if local is None and external_error is not None:
+            return _account_switch_error("切换 codex_login 账号", external_error)
+        try:
+            email, _ = await _invoke_account_mutation(
+                account_switch.switch_account,
+                selector,
+            )
+        except Exception as exc:
+            return _account_switch_error("切换 CodexBot 加密快照", exc)
         detail = _safe_field(email, fallback="未知邮箱")
+        display_name = _safe_field(selector)
         return (
-            f"已切换到账号 {name}（{detail}）。\n"
-            f"当前登录：{current}\n"
-            "请重启 Codex（完全退出后重开）使新账号生效。"
+            f"已切换到 CodexBot 加密快照 {display_name}（{detail}）。\n"
+            "已更新 Codex 登录；现在可以重新启动 Codex。"
         )
     if action == "delete":
         if len(tokens) < 2:
             return "用法：/account delete 名称"
         name = " ".join(tokens[1:])
         try:
-            account_switch.delete_account(name)
+            await _invoke_account_mutation(account_switch.delete_account, name)
         except account_switch.AccountSwitchError as exc:
-            return f"删除失败：{_safe_field(exc)}"
-        return f"已删除账号 {name}。"
+            return _account_switch_error("删除", exc)
+        except Exception as exc:
+            return _account_switch_error("删除", exc)
+        return f"已删除账号 {_safe_field(name)}。"
     return (
         "用法：\n"
         "/account save 名称 - 保存当前账号\n"
-        "/account list - 列出已保存账号\n"
-        "/account use 名称 - 切换账号（重启 Codex 生效）\n"
-        "/account delete 名称 - 删除账号"
+        "/account list - 列出 codex_login 账号和加密快照\n"
+        "/account use 序号/名称/邮箱/ID - 安全切换账号\n"
+        "/account delete 名称 - 删除 CodexBot 加密快照"
     )
 
 

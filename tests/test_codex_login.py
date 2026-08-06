@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import os
+import subprocess
 import threading
 import time
 from typing import Any
@@ -139,8 +141,10 @@ class FakeProcess:
 class FakePopen:
     def __init__(self) -> None:
         self.processes: list[FakeProcess] = []
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
 
-    def __call__(self, _command: list[str], **_kwargs: Any) -> FakeProcess:
+    def __call__(self, command: list[str], **kwargs: Any) -> FakeProcess:
+        self.calls.append((command, kwargs))
         process = FakeProcess()
         self.processes.append(process)
         return process
@@ -171,6 +175,10 @@ def test_device_code_keeps_process_alive_and_completes_by_matching_login_id() ->
     assert start.user_code == "ABCD-EFGH"
     assert process.terminated is False
     assert process.methods == ["initialize", "initialized", "account/login/start"]
+    if os.name == "nt":
+        launch_kwargs = fake_popen.calls[0][1]
+        assert launch_kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW
+        assert "startupinfo" in launch_kwargs
 
     process.push_completion(login_id="other-login", success=True)
     time.sleep(0.05)

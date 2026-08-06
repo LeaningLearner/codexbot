@@ -18,6 +18,7 @@ from .paths import data_dir, database_path, ensure_data_dir, runtime_python
 from .processes import ensure_daemon, process_matches
 from .security import generate_pairing_code, load_credentials, redact_secrets, store_credentials
 from .store import Store
+from .subprocess_utils import hidden_console_subprocess_kwargs
 
 
 STANDALONE_SETTING = "daemon_standalone"
@@ -110,6 +111,7 @@ def _codex_plugin_installed() -> tuple[bool, str]:
             capture_output=True,
             timeout=20,
             check=False,
+            **hidden_console_subprocess_kwargs(),
         )
         if completed.returncode:
             return False, _safe_cli_text(completed.stderr or completed.stdout, limit=180)

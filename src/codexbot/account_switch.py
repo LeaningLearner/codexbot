@@ -17,11 +17,13 @@ Security notes:
 import base64
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,7 +65,9 @@ class AccountSnapshot:
 
 
 def auth_file_path() -> Path:
-    return Path.home() / ".codex" / "auth.json"
+    override = os.environ.get("CODEX_HOME")
+    codex_home = Path(override).expanduser() if override else Path.home() / ".codex"
+    return codex_home / "auth.json"
 
 
 def accounts_dir() -> Path:
@@ -80,6 +84,14 @@ def _slugify(name: str) -> str:
 
 
 def _snapshot_path(name: str) -> Path:
+    display_name = name.strip()
+    digest = hashlib.sha256(display_name.casefold().encode("utf-8")).hexdigest()[:16]
+    return accounts_dir() / f"{_slugify(display_name)}--{digest}.enc"
+
+
+def _legacy_snapshot_path(name: str) -> Path:
+    """Path used before names gained a collision-resistant suffix."""
+
     return accounts_dir() / f"{_slugify(name)}.enc"
 
 
@@ -89,10 +101,14 @@ def _read_auth_json() -> dict[str, Any]:
         raise NotLoggedInError("~/.codex/auth.json 不存在，请先在 Codex 中登录。")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AccountSwitchError(f"auth.json 无法解析：{type(exc).__name__}") from exc
-    if not isinstance(data, dict) or "tokens" not in data:
-        raise AccountSwitchError("auth.json 不是 ChatGPT 登录格式（缺少 tokens），无法保存。")
+    if not isinstance(data, dict):
+        raise AccountSwitchError("auth.json 的根节点必须是对象。")
+    tokens = data.get("tokens")
+    api_key = data.get("OPENAI_API_KEY") or data.get("openai_api_key")
+    if not isinstance(tokens, dict) and not isinstance(api_key, str):
+        raise AccountSwitchError("auth.json 既不包含 ChatGPT tokens，也不包含 API key，无法保存。")
     return data
 
 
@@ -110,9 +126,10 @@ def _jwt_payload(token: str) -> dict[str, Any]:
 def _account_identity(data: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return (email, account_id) from an auth.json payload without logging tokens."""
 
-    tokens = data.get("tokens") or {}
+    raw_tokens = data.get("tokens")
+    tokens = raw_tokens if isinstance(raw_tokens, dict) else {}
     email = data.get("email")
-    account_id = data.get("account_id")
+    account_id = data.get("account_id") or tokens.get("account_id")
     if not email:
         for token_name in ("id_token", "access_token"):
             token = tokens.get(token_name)
@@ -171,6 +188,8 @@ def _write_atomic(target: Path, content: bytes) -> None:
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, target)
     finally:
         try:
@@ -200,41 +219,86 @@ def save_current_account(name: str) -> AccountSnapshot:
     return AccountSnapshot(display_name, email, account_id, snapshot["saved_at"])
 
 
-def _load_snapshot(name: str) -> dict[str, Any]:
-    path = _snapshot_path(name)
-    if not path.is_file():
-        raise SnapshotNotFoundError(f"未找到已保存的账号 {name!r}，请先用 /account save 保存。")
+def _load_snapshot_path(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(_dpapi_unprotect(path.read_bytes()).decode("utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise InvalidSnapshotError(f"账号快照 {name!r} 无法解密或解析。") from exc
-    if not isinstance(payload, dict) or "auth_json" not in payload:
-        raise InvalidSnapshotError(f"账号快照 {name!r} 格式无效。")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InvalidSnapshotError(f"账号快照 {path.stem!r} 无法解密或解析。") from exc
+    auth_json = payload.get("auth_json") if isinstance(payload, dict) else None
+    if not isinstance(auth_json, dict):
+        raise InvalidSnapshotError(f"账号快照 {path.stem!r} 格式无效。")
     return payload
+
+
+def _load_snapshot(name: str) -> dict[str, Any]:
+    display_name = name.strip()
+    for path in (_snapshot_path(display_name), _legacy_snapshot_path(display_name)):
+        if not path.is_file():
+            continue
+        payload = _load_snapshot_path(path)
+        stored_name = str(payload.get("name") or path.stem)
+        if stored_name.casefold() == display_name.casefold():
+            return payload
+
+    # Legacy slug-only files can collide, and renamed snapshot files may no
+    # longer be derivable from the display name. Resolve by metadata as a safe
+    # compatibility fallback.
+    if accounts_dir().is_dir():
+        for path in accounts_dir().glob("*.enc"):
+            try:
+                payload = _load_snapshot_path(path)
+            except AccountSwitchError:
+                continue
+            if str(payload.get("name") or "").casefold() == display_name.casefold():
+                return payload
+    raise SnapshotNotFoundError(f"未找到已保存的账号 {name!r}，请先用 /account save 保存。")
 
 
 def list_accounts() -> list[AccountSnapshot]:
     accounts_dir().mkdir(parents=True, exist_ok=True)
-    result: list[AccountSnapshot] = []
+    by_name: dict[str, AccountSnapshot] = {}
     for path in sorted(accounts_dir().glob("*.enc")):
         try:
-            payload = _load_snapshot(path.stem)
+            payload = _load_snapshot_path(path)
         except AccountSwitchError:
             continue
-        result.append(
-            AccountSnapshot(
-                name=str(payload.get("name") or path.stem),
-                email=payload.get("email"),
-                account_id=payload.get("account_id"),
-                saved_at=float(payload.get("saved_at") or 0.0),
-            )
+        try:
+            saved_at = float(payload.get("saved_at") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        snapshot = AccountSnapshot(
+            name=str(payload.get("name") or path.stem),
+            email=payload.get("email"),
+            account_id=payload.get("account_id"),
+            saved_at=saved_at,
         )
-    return result
+        key = snapshot.name.casefold()
+        previous = by_name.get(key)
+        if previous is None or snapshot.saved_at >= previous.saved_at:
+            by_name[key] = snapshot
+    return sorted(by_name.values(), key=lambda item: (item.name.casefold(), item.saved_at))
 
 
-def switch_account(name: str) -> tuple[str | None, str | None]:
+def _running_codex_processes() -> tuple[int, ...]:
+    # Import lazily so the legacy DPAPI snapshot feature stays independent of
+    # the optional codex_login-compatible account store at import time.
+    from .codex_accounts import find_running_codex_processes
+
+    return find_running_codex_processes()
+
+
+def switch_account(
+    name: str,
+    *,
+    process_checker: Callable[[], tuple[int, ...]] | None = None,
+) -> tuple[str | None, str | None]:
     """Swap ~/.codex/auth.json to the saved snapshot, backing up the current one."""
 
+    running = tuple((process_checker or _running_codex_processes)())
+    if running:
+        raise AccountSwitchError(
+            f"检测到 {len(running)} 个 Codex/ChatGPT 进程正在运行，请完全退出后再切换账号。"
+        )
     payload = _load_snapshot(name)
     auth_json = payload["auth_json"]
     target = auth_file_path()
@@ -245,9 +309,10 @@ def switch_account(name: str) -> tuple[str | None, str | None]:
             current = None
         if current is not None:
             backups_dir().mkdir(parents=True, exist_ok=True)
+            current_email, current_account_id = _account_identity(current)
             backup = {
-                "email": payload.get("email"),
-                "account_id": payload.get("account_id"),
+                "email": current_email,
+                "account_id": current_account_id,
                 "saved_at": time.time(),
                 "auth_json": current,
             }
@@ -260,13 +325,36 @@ def switch_account(name: str) -> tuple[str | None, str | None]:
 
 
 def delete_account(name: str) -> None:
-    path = _snapshot_path(name)
-    if not path.is_file():
+    display_name = name.strip()
+    matches: set[Path] = set()
+    for candidate in (_snapshot_path(display_name), _legacy_snapshot_path(display_name)):
+        if not candidate.is_file():
+            continue
+        try:
+            payload = _load_snapshot_path(candidate)
+        except AccountSwitchError:
+            continue
+        if str(payload.get("name") or candidate.stem).casefold() == display_name.casefold():
+            matches.add(candidate)
+    if accounts_dir().is_dir():
+        for candidate in accounts_dir().glob("*.enc"):
+            if candidate in matches:
+                continue
+            try:
+                payload = _load_snapshot_path(candidate)
+            except AccountSwitchError:
+                continue
+            if str(payload.get("name") or "").casefold() == display_name.casefold():
+                matches.add(candidate)
+    if not matches:
         raise SnapshotNotFoundError(f"未找到已保存的账号 {name!r}。")
-    try:
-        path.unlink()
-    except OSError as exc:
-        raise AccountSwitchError(f"删除账号 {name!r} 失败：{exc}") from exc
+    for path in matches:
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise AccountSwitchError(
+                f"删除账号 {name!r} 失败：{type(exc).__name__}"
+            ) from None
 
 
 def current_account_email() -> str | None:

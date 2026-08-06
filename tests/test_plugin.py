@@ -25,16 +25,18 @@ def test_hook_registration_is_complete_and_neutral() -> None:
         assert len(registrations) == 1
         hook = registrations[0]["hooks"][0]
         assert hook["type"] == "command"
+        # The source tree stays portable; installation materializes the batch
+        # entry and runtime arguments to absolute local paths.
+        assert "${PLUGIN_ROOT}" in hook["command"]
+        assert hook["commandWindows"].casefold().startswith("py.exe -3.11 -e ")
+        assert "entry.py" in hook["commandWindows"].casefold()
         assert "${PLUGIN_ROOT}" in hook["commandWindows"]
-        # Windowless Windows path: pythonw.exe runs entry.py directly so the
-        # cmd.exe console never flashes during a Codex session.
-        assert "pythonw.exe" in hook["commandWindows"]
-        assert "cmd /d /s /c" not in hook["commandWindows"]
-        assert "${PLUGIN_ROOT}\\hooks\\entry.py" in hook["commandWindows"]
+        assert "%LOCALAPPDATA%" not in hook["commandWindows"]
+        assert "powershell" not in hook["commandWindows"].casefold()
+        assert r"C:\Users" not in hook["commandWindows"]
+        assert "周怡舟" not in hook["commandWindows"]
         assert hook["timeout"] <= 2
         assert set(hook) == {"type", "command", "commandWindows", "timeout"}
-
-    assert (PLUGIN / "hooks" / "entry.cmd").is_file()
 
 
 def test_install_path_locks_runtime_and_pep517_build_dependencies() -> None:

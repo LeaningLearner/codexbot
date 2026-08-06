@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from .botpy_safety import silence_botpy_logging
@@ -10,6 +11,9 @@ from .delivery import RateLimiter, deliver_item
 from .processes import process_matches
 from .security import Credentials, redact_secrets
 from .store import Store
+
+
+HOSTLESS_STARTUP_GRACE_SECONDS = 15.0
 
 
 class QQRuntime:
@@ -30,6 +34,11 @@ class QQRuntime:
         self.limiter = RateLimiter(per_minute=18)
         self.monitor_interval = 1.0
         self.empty_host_checks = 2
+        # A detached Windows hook may outlive the short-lived Codex command
+        # runner that invoked it.  Keep the companion alive long enough for
+        # the QQ websocket to become ready and flush an already-queued final
+        # notification even when no live host can be registered.
+        self.hostless_startup_grace = HOSTLESS_STARTUP_GRACE_SECONDS
         # Leave enough time for rate-limited chunks of the final reply while
         # still guaranteeing that shutdown cannot wait forever.
         self.shutdown_drain_timeout = 60.0
@@ -76,6 +85,7 @@ class QQRuntime:
             self.logger.error("QQ command failed: %s: %s", type(exc).__name__, detail)
 
     async def monitor_hosts(self) -> None:
+        started_at = time.monotonic()
         empty_checks = 0
         while not self.stop_event.is_set():
             hosts = self.store.list_hosts()
@@ -83,6 +93,7 @@ class QQRuntime:
             if dead:
                 self.store.remove_hosts(dead)
             alive_count = len(hosts) - len(dead)
+            pending_work = self.store.companion_work_pending()
             if self.standalone:
                 # Standalone mode keeps the QQ client online regardless of
                 # Codex host activity; dead host rows are still pruned.
@@ -90,7 +101,20 @@ class QQRuntime:
                 continue
             if alive_count:
                 empty_checks = 0
+            elif pending_work:
+                # Do not let a websocket reconnect delay, QQ rate limit, or a
+                # multi-part final reply strand reliable outbox work merely
+                # because the short-lived Codex runner has already exited.
+                empty_checks = 0
             else:
+                within_startup_grace = (
+                    not self.ready_event.is_set()
+                    and time.monotonic() - started_at < self.hostless_startup_grace
+                )
+                if within_startup_grace:
+                    empty_checks = 0
+                    await asyncio.sleep(self.monitor_interval)
+                    continue
                 empty_checks += 1
                 if empty_checks >= self.empty_host_checks:
                     self.logger.info("No Codex host remains; stopping companion")

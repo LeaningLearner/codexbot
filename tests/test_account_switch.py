@@ -47,6 +47,7 @@ def isolated(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(account_switch, "auth_file_path", _auth_path)
     monkeypatch.setattr(account_switch, "data_dir", _data_dir)
+    monkeypatch.setattr(account_switch, "_running_codex_processes", lambda: ())
 
 
 def test_save_then_list(monkeypatch, tmp_path: Path, isolated: None) -> None:
@@ -62,6 +63,21 @@ def test_save_then_list(monkeypatch, tmp_path: Path, isolated: None) -> None:
     assert accounts[0].email == "alice@example.com"
 
 
+def test_non_ascii_snapshot_names_do_not_overwrite_each_other(
+    monkeypatch, tmp_path: Path, isolated: None
+) -> None:
+    _write_auth(tmp_path, email="alice@example.com", account_id="acct-1")
+    account_switch.save_current_account("工作账号")
+    _write_auth(tmp_path, email="bob@example.com", account_id="acct-2")
+    account_switch.save_current_account("个人账号")
+
+    assert {account.name for account in account_switch.list_accounts()} == {
+        "工作账号",
+        "个人账号",
+    }
+    assert len(list(account_switch.accounts_dir().glob("*.enc"))) == 2
+
+
 def test_switch_replaces_auth_file(monkeypatch, tmp_path: Path, isolated: None) -> None:
     _write_auth(tmp_path, email="alice@example.com", account_id="acct-1")
     account_switch.save_current_account("alice")
@@ -74,6 +90,37 @@ def test_switch_replaces_auth_file(monkeypatch, tmp_path: Path, isolated: None) 
     assert account_id == "acct-1"
     active = json.loads(account_switch.auth_file_path().read_text(encoding="utf-8"))
     assert active["account_id"] == "acct-1"
+
+
+def test_switch_is_blocked_while_codex_is_running(
+    monkeypatch, tmp_path: Path, isolated: None
+) -> None:
+    _write_auth(tmp_path, email="alice@example.com", account_id="acct-1")
+    account_switch.save_current_account("alice")
+
+    with pytest.raises(account_switch.AccountSwitchError, match="正在运行"):
+        account_switch.switch_account("alice", process_checker=lambda: (1234,))
+
+
+def test_auth_path_honors_codex_home(monkeypatch, tmp_path: Path) -> None:
+    codex_home = tmp_path / "custom-codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert account_switch.auth_file_path() == codex_home / "auth.json"
+
+
+def test_account_identity_reads_nested_account_id() -> None:
+    email, account_id = account_switch._account_identity(
+        {
+            "tokens": {
+                "id_token": _make_jwt({"email": "nested@example.com"}),
+                "account_id": "nested-account",
+            }
+        }
+    )
+
+    assert email == "nested@example.com"
+    assert account_id == "nested-account"
 
 
 def test_switch_backs_up_current(monkeypatch, tmp_path: Path, isolated: None) -> None:
@@ -94,6 +141,22 @@ def test_delete_account(monkeypatch, tmp_path: Path, isolated: None) -> None:
     assert account_switch.list_accounts() == []
     with pytest.raises(account_switch.SnapshotNotFoundError):
         account_switch.delete_account("alice")
+
+
+def test_delete_removes_new_and_legacy_copies(
+    monkeypatch, tmp_path: Path, isolated: None
+) -> None:
+    _write_auth(tmp_path)
+    account_switch.save_current_account("alice")
+    current = account_switch._snapshot_path("alice")
+    legacy = account_switch._legacy_snapshot_path("alice")
+    legacy.write_bytes(current.read_bytes())
+
+    account_switch.delete_account("alice")
+
+    assert not current.exists()
+    assert not legacy.exists()
+    assert account_switch.list_accounts() == []
 
 
 def test_save_requires_login(monkeypatch, tmp_path: Path, isolated: None) -> None:

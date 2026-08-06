@@ -790,6 +790,23 @@ class Store:
             created_at=float(row["created_at"]),
         )
 
+    def has_pending_outbox(self) -> bool:
+        """Return whether reliable delivery still has work to finish."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM outbox WHERE state = 'pending' LIMIT 1"
+            ).fetchone()
+        return row is not None
+
+    def companion_work_pending(self) -> bool:
+        """Return whether a hostless QQ companion still has useful work."""
+
+        pairing_active, _ = self.pairing_status()
+        if pairing_active:
+            return True
+        return bool(self.get_bound_openid()) and self.has_pending_outbox()
+
     def prepare_segments(self, item_id: int, segments: list[str]) -> None:
         with self._connection() as connection:
             connection.execute(
