@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::env;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -10,7 +9,7 @@ use chrono::Utc;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::subprocess_utils::hide_console_window;
+use crate::subprocess_utils::{find_codex_executable, hide_console_window};
 
 pub const PLUGIN_NAME: &str = "codexbot";
 pub const CORE_HOOK_EVENTS: [&str; 4] = ["SessionEnd", "SessionStart", "Stop", "UserPromptSubmit"];
@@ -322,42 +321,8 @@ fn merge_marketplace(path: &Path) -> Result<String> {
     Ok(name)
 }
 
-fn path_candidates(name: &str) -> impl Iterator<Item = PathBuf> {
-    let path = env::var_os("PATH").unwrap_or_default();
-    let extensions: Vec<OsString> = if cfg!(windows) {
-        env::var_os("PATHEXT")
-            .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into())
-            .to_string_lossy()
-            .split(';')
-            .map(OsString::from)
-            .collect()
-    } else {
-        vec![OsString::new()]
-    };
-    let mut values = Vec::new();
-    for directory in env::split_paths(&path) {
-        let direct = directory.join(name);
-        values.push(direct.clone());
-        if direct.extension().is_none() {
-            for extension in &extensions {
-                if !extension.is_empty() {
-                    values.push(directory.join(format!(
-                        "{}{}",
-                        name,
-                        extension.to_string_lossy().to_ascii_lowercase()
-                    )));
-                }
-            }
-        }
-    }
-    values.into_iter()
-}
-
 pub fn find_codex_command() -> Option<PathBuf> {
-    ["codex", "codex.exe", "codex.cmd"]
-        .into_iter()
-        .flat_map(path_candidates)
-        .find(|candidate| candidate.is_file())
+    find_codex_executable()
 }
 
 fn run_codex(command: &Path, arguments: &[&str]) -> Result<Output> {

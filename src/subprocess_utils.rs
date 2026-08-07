@@ -1,5 +1,6 @@
 //! Helpers for starting Codex child processes without a console window.
 
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -44,6 +45,74 @@ pub fn hide_console_window(command: &mut Command) -> &mut Command {
 
 pub fn npm_codex_native_executable(shim: impl AsRef<Path>) -> Option<PathBuf> {
     npm_codex_native_executable_for(shim.as_ref(), cfg!(windows), std::env::consts::ARCH)
+}
+
+fn executable_on_path(name: &str) -> Option<PathBuf> {
+    let candidate = Path::new(name);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|directory| directory.join(candidate))
+        .find(|candidate| candidate.is_file())
+}
+
+fn resolve_codex_executable_for(program: &Path, windows: bool, machine: &str) -> Option<PathBuf> {
+    if !program.is_file() {
+        return None;
+    }
+    if !windows {
+        return Some(program.to_path_buf());
+    }
+    match program
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("cmd") => npm_codex_native_executable_for(program, true, machine),
+        Some("exe") => Some(program.to_path_buf()),
+        _ => None,
+    }
+}
+
+/// Locate an executable Codex program. On Windows this deliberately resolves
+/// the npm `codex.cmd` shim to its bundled native executable because
+/// `std::process::Command` cannot execute batch files directly.
+pub fn find_codex_executable() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(shim) = executable_on_path("codex.cmd")
+            && let Some(native) = resolve_codex_executable_for(&shim, true, std::env::consts::ARCH)
+        {
+            return Some(native);
+        }
+        executable_on_path("codex.exe").and_then(|program| {
+            resolve_codex_executable_for(&program, true, std::env::consts::ARCH)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        executable_on_path("codex")
+    }
+}
+
+/// Resolve an explicit Codex command override without accepting a Windows
+/// script that `Command` would later reject with `ERROR_BAD_EXE_FORMAT`.
+pub fn resolve_codex_executable(program: impl AsRef<Path>) -> Option<PathBuf> {
+    let program = program.as_ref();
+    #[cfg(windows)]
+    if program.components().count() == 1
+        && program
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("codex"))
+    {
+        return find_codex_executable();
+    }
+    let located = executable_on_path(program.to_str()?)?;
+    resolve_codex_executable_for(&located, cfg!(windows), std::env::consts::ARCH)
 }
 
 /// Testable resolver for the optional native binary shipped behind the npm
@@ -110,9 +179,17 @@ mod tests {
         std::fs::write(&native, b"MZ").unwrap();
         assert_eq!(
             npm_codex_native_executable_for(&shim, true, "AMD64"),
-            Some(native)
+            Some(native.clone())
         );
         assert_eq!(npm_codex_native_executable_for(&shim, false, "AMD64"), None);
+        assert_eq!(
+            resolve_codex_executable_for(&shim, true, "AMD64"),
+            Some(native.clone())
+        );
+        assert_eq!(
+            resolve_codex_executable_for(&native, true, "AMD64"),
+            Some(native)
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

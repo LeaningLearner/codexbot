@@ -5,7 +5,6 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -16,6 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::security::redact_secrets;
+use crate::subprocess_utils::{find_codex_executable, resolve_codex_executable};
 
 pub const APP_SERVER_DASHBOARD_URL: &str = "https://chatgpt.com/codex/settings/usage";
 pub const DEFAULT_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -237,20 +237,17 @@ impl CodexAppServerClient {
             return Ok(command);
         }
         if let Some(command) = std::env::var_os("CODEX_COMMAND").filter(|value| !value.is_empty()) {
-            return Ok(vec![command]);
+            return resolve_codex_executable(&command)
+                .map(|program| vec![program.into_os_string()])
+                .ok_or_else(|| {
+                    AppServerError::Unavailable(
+                        "CODEX_COMMAND 未指向可直接执行的 Codex 程序".to_owned(),
+                    )
+                });
         }
-        #[cfg(windows)]
-        let candidates = ["codex.cmd", "codex.exe", "codex"];
-        #[cfg(not(windows))]
-        let candidates = ["codex", "codex", "codex"];
-        for candidate in candidates {
-            if command_exists(candidate) {
-                return Ok(vec![OsString::from(candidate)]);
-            }
-        }
-        Err(AppServerError::Unavailable(
-            "找不到 codex/codex.cmd".to_owned(),
-        ))
+        find_codex_executable()
+            .map(|program| vec![program.into_os_string()])
+            .ok_or_else(|| AppServerError::Unavailable("找不到可执行的 Codex 程序".to_owned()))
     }
 
     pub async fn open_session(
@@ -354,17 +351,6 @@ impl CodexAppServerClient {
         let start = parse_device_login_result(&result)?;
         Ok((session, start))
     }
-}
-
-fn command_exists(command: &str) -> bool {
-    let command = PathBuf::from(command);
-    if command.components().count() > 1 {
-        return command.is_file();
-    }
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|directory| directory.join(&command).is_file())
 }
 
 pub struct CodexAppServerSession {
