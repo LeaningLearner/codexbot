@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <a href="https://www.python.org/downloads/release/python-3110/"><img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" alt="Python 3.11"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85%2B-000000?logo=rust&logoColor=white" alt="Rust 1.85+"></a>
   <a href="https://www.microsoft.com/windows"><img src="https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D4?logo=windows&logoColor=white" alt="Windows 10/11"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License"></a>
 </p>
@@ -46,8 +46,8 @@ CodexBot 是一个运行在 Windows 本机的 Codex 生命周期通知桥接器�
 
 ### 环境要求
 
-- Windows 10 或 Windows 11（x64；当前哈希锁固定为 `win_amd64` wheel）。
-- Python 3.11.x。项目要求 `>=3.11,<3.12`，安装器会优先查找 `py -3.11`。
+- Windows 10 或 Windows 11（x64）；Rust 依赖版本由 `Cargo.lock` 锁定。
+- Rust 1.85 或更高版本（通过 [rustup](https://rustup.rs/) 安装稳定版即可）；安装器会调用 `cargo build --release --locked`。
 - 已安装并能正常运行的 Codex Desktop 或 Codex CLI，且支持 Codex Plugins / Lifecycle Hooks。
 - `/usage` 和 `/account` 已在 Codex CLI 0.146.0 验证；缺少 app-server auth endpoint 的旧版会显示降级提示。
 - 一个 QQ 官方机器人沙箱应用，并取得 AppID、AppSecret；需要在 QQ 开放平台启用私聊事件和主动消息能力。
@@ -66,8 +66,8 @@ cd codexbot
 
 安装器会完成以下工作：
 
-1. 在 `%LOCALAPPDATA%\CodexBot\runtime` 创建隔离的 Python 3.11 环境。
-2. 安装锁定版本的依赖和 CodexBot。
+1. 使用锁定依赖构建原生 Rust 发布版。
+2. 将单一 `codexbot.exe` 安装到 `%LOCALAPPDATA%\CodexBot\bin`。
 3. 将 QQ 凭据写入 Windows Credential Manager。
 4. 安装个人 Codex 插件并注册生命周期 Hooks。
 5. 生成一次性 QQ 配对码。
@@ -154,7 +154,7 @@ cd codexbot
 
 - `state.sqlite3`：会话状态、通知 outbox、配对和最近回复。
 - `logs\`：诊断日志，避免记录完整提示词、完整回复和常见密钥。
-- `runtime\`：CodexBot 专用 Python 环境。
+- `bin\codexbot.exe`：CodexBot 原生运行时，不依赖 Python 或虚拟环境。
 
 请不要提交 AppSecret、Access Token、SQLite 数据库或日志。如果凭据曾经出现在公开仓库、截图或日志中，请立即在 QQ 开放平台重新生成。
 
@@ -173,11 +173,14 @@ cd codexbot
 ### 开发与验证
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe "%USERPROFILE%\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py" plugin\codexbot
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo run -- doctor --offline
+py -3.11 "%USERPROFILE%\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py" plugin\codexbot
 ```
+
+最后一条命令使用 Codex 提供的插件开发验证器；Python 不是 CodexBot 的运行时依赖。
 
 ### 相关文档
 
@@ -217,8 +220,8 @@ CodexBot is a Windows companion that observes Codex lifecycle hooks, stores even
 
 ### Requirements
 
-- Windows 10 or Windows 11 on x64; the current hash lock pins `win_amd64` wheels.
-- Python 3.11.x. The package requires `>=3.11,<3.12`.
+- Windows 10 or Windows 11 on x64; Rust dependency versions are pinned by `Cargo.lock`.
+- Rust 1.85 or newer (the stable toolchain from [rustup](https://rustup.rs/) is sufficient).
 - A working Codex Desktop or Codex CLI installation with Codex Plugins / Lifecycle Hooks support.
 - `/usage` and `/account` are verified with Codex CLI 0.146.0; older builds without the app-server auth endpoints show a graceful fallback.
 - An official QQ Bot sandbox application with an AppID and AppSecret, with private-message events and proactive messaging enabled.
@@ -235,7 +238,7 @@ cd codexbot
 .\install.cmd
 ```
 
-The installer creates an isolated Python runtime, installs pinned dependencies, stores QQ credentials in Windows Credential Manager, installs the personal Codex plugin, and generates a one-time pairing code.
+The installer builds the dependency-locked native binary, copies `codexbot.exe` into `%LOCALAPPDATA%\CodexBot\bin`, stores QQ credentials in Windows Credential Manager, installs the personal Codex plugin, and generates a one-time pairing code. Python and a virtual environment are no longer required.
 
 Restart Codex, open `/hooks`, and trust the `codexbot` lifecycle hooks. Then send the pairing command shown by the installer to the QQ bot:
 
@@ -301,11 +304,14 @@ Account and rate-limit reads do not start model inference and therefore add no C
 ### Development
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m pytest
-.\.venv\Scripts\python.exe "%USERPROFILE%\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py" plugin\codexbot
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo run -- doctor --offline
+py -3.11 "%USERPROFILE%\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py" plugin\codexbot
 ```
+
+The final command invokes Codex's plugin-development validator; Python is not a CodexBot runtime dependency.
 
 ## License
 

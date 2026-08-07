@@ -1,24 +1,17 @@
 @echo off
 setlocal
-
-set "CODEXBOT_HOOK_ROOT=%~dp0"
-if not "%~1"=="" (
-  set "CODEXBOT_RUNTIME=%~1"
-) else if defined CODEXBOT_DATA_DIR (
-  set "CODEXBOT_RUNTIME=%CODEXBOT_DATA_DIR%\runtime\Scripts\python.exe"
+if defined CODEXBOT_DATA_DIR (
+  set "CODEXBOT_EXE=%CODEXBOT_DATA_DIR%\bin\codexbot.exe"
+) else if defined LOCALAPPDATA (
+  set "CODEXBOT_EXE=%LOCALAPPDATA%\CodexBot\bin\codexbot.exe"
 ) else (
-  if not defined LOCALAPPDATA (
-    echo {}
-    exit /b 0
-  )
-  set "CODEXBOT_RUNTIME=%LOCALAPPDATA%\CodexBot\runtime\Scripts\python.exe"
-)
-
-if not exist "%CODEXBOT_RUNTIME%" (
   echo {}
   exit /b 0
 )
-
-"%CODEXBOT_RUNTIME%" -E "%CODEXBOT_HOOK_ROOT%entry.py" --runtime "%CODEXBOT_RUNTIME%" 2>nul
+if not exist "%CODEXBOT_EXE%" (
+  echo {}
+  exit /b 0
+)
+"%CODEXBOT_EXE%" hook 2>nul
 if errorlevel 1 echo {}
 exit /b 0

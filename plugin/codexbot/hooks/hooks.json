@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]
@@ -18,8 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]
@@ -30,8 +30,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]
@@ -42,8 +42,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]
@@ -54,8 +54,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]
@@ -66,8 +66,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${PLUGIN_ROOT}/hooks/entry.py\"",
-            "commandWindows": "py.exe -3.11 -E \"${PLUGIN_ROOT}\\hooks\\entry.py\"",
+            "command": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
+            "commandWindows": "cmd.exe /D /S /C \"\"${PLUGIN_ROOT}\\hooks\\entry.cmd\"\"",
             "timeout": 2
           }
         ]

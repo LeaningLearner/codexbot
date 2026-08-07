@@ -1,0 +1,53 @@
+[package]
+name = "codexbot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A native Codex lifecycle notification bridge for the official QQ bot sandbox"
+license = "MIT"
+repository = "https://github.com/LeaningLearner/codexbot"
+
+[[bin]]
+name = "codexbot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+sysinfo = "0.33"
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+unicode-normalization = "0.1"
+uuid = { version = "1.12", features = ["v4"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.15"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
